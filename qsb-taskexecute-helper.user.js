@@ -5,8 +5,8 @@
 // @description  店铺级即时筛选 + 运行异常分类外显（悬浮秒出）
 // @author       青藤
 // @match        https://dep.ai-indeed.com/*
-// @updateURL    https://raw.githubusercontent.com/Ivy-reverie-vine/qushubao-userscripts/main/qsb-taskexecute-helper.user.js
-// @downloadURL  https://raw.githubusercontent.com/Ivy-reverie-vine/qushubao-userscripts/main/qsb-taskexecute-helper.user.js
+// @updateURL    https://ivy-reverie-vine.github.io/qushubao-userscripts/qsb-taskexecute-helper.user.js
+// @downloadURL  https://ivy-reverie-vine.github.io/qushubao-userscripts/qsb-taskexecute-helper.user.js
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
