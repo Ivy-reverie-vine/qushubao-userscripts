@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         取数宝-任务运行记录助手
 // @namespace    https://dep.ai-indeed.com/qsb-taskexecute-helper
-// @version      1.0.5
+// @version      1.0.6
 // @description  店铺级即时筛选 + 运行异常分类外显（悬浮秒出）
 // @author       青藤
 // @match        https://dep.ai-indeed.com/*
@@ -18,8 +18,8 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qsb-taskexecute-helper.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.0.5';            // 与头部 @version 保持一致，发版时同步修改
-  const TARGET_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 仅在目标路由激活功能
+  const VERSION = 'v1.0.6';            // 与头部 @version 保持一致，发版时同步修改
+  const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const ROUTE_POLL_MS = 1000;          // 路由变化兜底轮询间隔
   const API_BASE = '/frameWorkPortal/opt/qymall/1.0.0';
   const PRELOAD_CONCURRENCY = 2;      // 后台预加载并发数
@@ -561,7 +561,19 @@
   // 功能 2：静默预加载 + 报错外显
   // ═══════════════════════════════════════════════════════════════
 
-  // ── 拦截 XHR 和 fetch 以捕获 /job/record/new 的请求体和响应 ──
+  // ── 响应钩子注册表：按 URL 声明要监听的接口，新增页面时只登记、不改拦截器 ──
+  const responseHooks = [];   // { match: string | RegExp, onRequest?(body, url), onResponse?(data, url) }
+
+  function onResponse(match, hooks) {
+    responseHooks.push({ match, ...hooks });
+  }
+
+  function hooksForUrl(url) {
+    if (!url) return [];
+    return responseHooks.filter(h => (typeof h.match === 'string' ? url.includes(h.match) : h.match.test(url)));
+  }
+
+  // ── 拦截 XHR 和 fetch，把命中的请求分发给注册的钩子 ──
   function setupResponseInterceptor() {
     // --- XHR ---
     const origXHROpen = XMLHttpRequest.prototype.open;
@@ -582,11 +594,13 @@
     };
 
     XMLHttpRequest.prototype.send = function (body) {
-      if (this._qsbUrl && this._qsbUrl.includes('/job/record/new')) {
-        // 从请求 body 提取 dateTime
-        tryExtractDateFromBody(body);
+      const hooks = hooksForUrl(this._qsbUrl);
+      if (hooks.length) {
+        hooks.forEach(h => { try { h.onRequest?.(body, this._qsbUrl); } catch (_) { } });
         this.addEventListener('load', function () {
-          try { onListResponseReceived(JSON.parse(this.responseText)); } catch (_) { }
+          let data = null;
+          try { data = JSON.parse(this.responseText); } catch (_) { return; }
+          hooks.forEach(h => { try { h.onResponse?.(data, this._qsbUrl); } catch (_) { } });
         });
       }
       return origXHRSend.call(this, body);
@@ -612,14 +626,15 @@
         } catch (_) { }
       }
 
-      if (url.includes('/job/record/new')) {
-        tryExtractDateFromBody(init?.body);
+      const hooks = hooksForUrl(url);
+      if (hooks.length) {
+        hooks.forEach(h => { try { h.onRequest?.(init?.body, url); } catch (_) { } });
       }
       const p = origFetch.apply(this, arguments);
-      if (url.includes('/job/record/new')) {
+      if (hooks.length) {
         p.then(response => {
           response.clone().json()
-            .then(data => onListResponseReceived(data))
+            .then(data => hooks.forEach(h => { try { h.onResponse?.(data, url); } catch (_) { } }))
             .catch(() => { });
           return response;
         });
@@ -1386,17 +1401,23 @@
   function esc(s) { return String(s).replace(/[&<>"']/g, c => _escMap[c]); }
 
   // ═══════════════════════════════════════════════════════════════
-  // 初始化：全站加载，仅目标路由激活（兼容站内 SPA 跳转）
+  // 页面注册表：一个脚本承载多个页面的能力，按 route 激活
+  // 约束：同一时刻只有一个页面处于激活状态，因此引擎级状态
+  //      （errorCache / 预加载队列 / tooltip 单例）可以共用，
+  //      页面级状态由各自的 state 承载，离开时随 teardown 清理。
   // ═══════════════════════════════════════════════════════════════
+  const PAGES = [];               // { name, route, setup(state), teardown(state) }
+
   let interceptorReady = false;   // 样式与请求拦截：整份文档只装一次
   let pageHooksReady = false;     // 事件委托与页面监听：整份文档只装一次
-  let pageActive = false;         // 目标页是否已激活
-  let barInjected = false;        // 本次激活内是否成功注入过筛选栏
-  let injectLoopRunning = false;  // 筛选栏注入重试循环是否在跑
-  let pageRunId = 0;              // 激活代次，用于作废旧的重试循环
+  let activePage = null;          // { def, state }；null 表示当前不在任何受管页面
 
-  function isTargetRoute() {
-    return TARGET_ROUTE.test(location.pathname);
+  function registerPage(def) {
+    PAGES.push(def);
+  }
+
+  function matchPage() {
+    return PAGES.find(p => p.route.test(location.pathname)) || null;
   }
 
   function ensureInterceptor() {
@@ -1413,59 +1434,36 @@
     setupPageChangeListeners();
   }
 
-  function enterTargetPage() {
-    if (!isTargetRoute()) return;
+  function enterPage(def) {
     ensureInterceptor();
     ensurePageHooks();
-    if (rearmPageObserver) rearmPageObserver();     // 旧表格容器可能已随路由销毁
+    if (rearmPageObserver) rearmPageObserver();     // 旧容器可能已随路由销毁
 
-    // 已在目标页且筛选栏还在（仅 query 变化、分页、keep-alive 回退），无需重复注入
-    if (pageActive && document.querySelector('.qsb-filter-bar')) return;
+    // 同一页面且 UI 还在（仅 query 变化、分页、keep-alive 回退），不重复激活
+    if (activePage && activePage.def === def && document.querySelector('.qsb-filter-bar')) return;
 
-    const runId = ++pageRunId;
-    if (!pageActive) {
-      pageActive = true;
-      console.log(LOG_TAG, VERSION, '目标页面已激活');
+    if (!activePage) {
+      activePage = { def, state: { runId: 0, barInjected: false, loopRunning: false } };
+      console.log(LOG_TAG, VERSION, `${def.name} 目标页面已激活`);
     }
-
-    injectLoopRunning = true;
-    const finish = () => {
-      if (runId === pageRunId) injectLoopRunning = false;
-    };
-
-    let retries = 0;
-    const tryInject = () => {
-      if (runId !== pageRunId || !isTargetRoute()) { finish(); return; }
-      if (retries >= INJECT_MAX_RETRIES) {
-        console.warn(LOG_TAG, '超时：未找到目标表单');
-        finish();
-        return;
-      }
-      if (injectFilterBar()) {
-        barInjected = true;
-        console.log(LOG_TAG, '筛选栏已注入');
-        finish();
-        setTimeout(attachTooltipListeners, 1000);
-      } else {
-        retries++;
-        setTimeout(tryInject, INJECT_RETRY_MS);
-      }
-    };
-    tryInject();
+    def.setup(activePage.state);
   }
 
-  function leaveTargetPage() {
-    if (!pageActive) return;
-    pageActive = false;
-    barInjected = false;
-    pageRunId++;                 // 作废仍在运行的重试循环
-    injectLoopRunning = false;
-    resetPreloadState();         // 中断预加载并关闭浮层
+  function leavePage() {
+    if (!activePage) return;
+    const { def, state } = activePage;
+    activePage = null;            // 先摘掉，teardown 里再进入别的页面时不会被误判为同一页
+    state.runId++;                // 作废仍在运行的重试循环
+    state.loopRunning = false;
+    state.barInjected = false;
+    def.teardown(state);
   }
 
   function onRouteMaybeChanged() {
-    if (isTargetRoute()) enterTargetPage();
-    else leaveTargetPage();
+    const def = matchPage();
+    const activeDef = activePage ? activePage.def : null;
+    if (def !== activeDef) leavePage();
+    if (def) enterPage(def);
   }
 
   function watchRoute() {
@@ -1491,9 +1489,10 @@
       }
       // 同一路径下页面被整体重渲染（容器销毁重建）时补注入；
       // 只在曾经注入成功过才补，避免表单结构变化时无限重试刷屏
-      if (pageActive && barInjected && !injectLoopRunning && !document.querySelector('.qsb-filter-bar')) {
-        barInjected = false;
-        enterTargetPage();
+      const state = activePage?.state;
+      if (state && state.barInjected && !state.loopRunning && !document.querySelector('.qsb-filter-bar')) {
+        state.barInjected = false;
+        enterPage(activePage.def);
       }
     }, ROUTE_POLL_MS);
   }
@@ -1502,6 +1501,51 @@
     watchRoute();
     onRouteMaybeChanged();
   }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 注册：任务运行记录页（筛选 + 报错外显）
+  // ═══════════════════════════════════════════════════════════════
+  onResponse('/job/record/new', {
+    onRequest: tryExtractDateFromBody,      // 从请求体取 dateTime
+    onResponse: onListResponseReceived      // 从响应体取记录，排队预加载
+  });
+
+  registerPage({
+    name: 'taskExecute',
+    route: TASK_EXECUTE_ROUTE,
+    setup(state) {
+      const runId = ++state.runId;
+      state.loopRunning = true;
+      const finish = () => {
+        if (runId === state.runId) state.loopRunning = false;
+      };
+
+      let retries = 0;
+      const tryInject = () => {
+        if (runId !== state.runId || !TASK_EXECUTE_ROUTE.test(location.pathname)) { finish(); return; }
+        if (retries >= INJECT_MAX_RETRIES) {
+          console.warn(LOG_TAG, '超时：未找到目标表单');
+          finish();
+          return;
+        }
+        if (injectFilterBar()) {
+          state.barInjected = true;
+          console.log(LOG_TAG, '筛选栏已注入');
+          finish();
+          setTimeout(attachTooltipListeners, 1000);
+        } else {
+          retries++;
+          setTimeout(tryInject, INJECT_RETRY_MS);
+        }
+      };
+      tryInject();
+    },
+    teardown() {
+      filterInput = null;         // 页码/筛选框句柄随 DOM 一起失效，清空避免跨页残留
+      countBadge = null;
+      resetPreloadState();        // 中断预加载并关闭浮层
+    }
+  });
 
   // 先装拦截器：SPA 进入目标页时首个列表请求可能早于路由回调
   ensureInterceptor();
