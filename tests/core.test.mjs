@@ -8,12 +8,13 @@ import vm from 'node:vm';
 const SRC = fs.readFileSync(new URL('../qsb-taskexecute-helper.user.js', import.meta.url), 'utf8');
 const TARGET = '/mallQuan/taskExecuteManagementV2';
 
-function makeElement(tag = 'div') {
+function makeElement(tag = 'div', rect = null) {
   const el = {
     tagName: String(tag).toUpperCase(),
     style: {},
     className: '',
     textContent: '',
+    dataset: {},
     children: [],
     classList: { add() { }, remove() { }, contains: () => false },
     appendChild(c) { el.children.push(c); return c; },
@@ -28,10 +29,68 @@ function makeElement(tag = 'div') {
     querySelector: () => null,
     querySelectorAll: () => [],
   };
+  // 只有显式给了几何信息的元素才像是"已布局"的，其余保持无 getBoundingClientRect
+  if (rect) {
+    el.getBoundingClientRect = () => ({
+      top: rect.top, height: rect.height, bottom: rect.top + rect.height
+    });
+  }
   return el;
 }
 
-function createEnv({ pathname = '/home', withForm = false } = {}) {
+// 表格桩：只实现脚本真正用到的查询口径（表头 th / 行 / 单元格属性）
+function makeTable({ headers, rows }) {
+  const ths = headers.map(text => {
+    const th = makeElement('th');
+    th.textContent = text;
+    return th;
+  });
+  const trs = rows.map(makeRow);
+  const table = makeElement('div');
+  table.className = 'ant-table';
+  table.querySelectorAll = sel => {
+    if (sel === '.ant-table-thead th') return ths;
+    if (sel === '.ant-table-tbody tr.ant-table-row') return trs;
+    return [];
+  };
+  table.rows = trs;
+  return table;
+}
+
+function makeRow({ key, cells }) {
+  const attrs = { 'data-row-key': key };
+  const tds = cells.map(text => {
+    const td = makeElement('td');
+    td.textContent = text;
+    const own = {};
+    const classes = new Set();
+    td.classList = { add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c) };
+    td.setAttribute = (k, v) => { own[k] = v; };
+    td.getAttribute = k => (k in own ? own[k] : null);
+    td.hasAttribute = k => k in own;
+    td.removeAttribute = k => { delete own[k]; };
+    td.querySelector = sel => {
+      if (sel === '.qsb-status-bar') {
+        return td.children.find(c => c.className === 'qsb-status-bar') || null;
+      }
+      return null;
+    };
+    return td;
+  });
+
+  const row = makeElement('tr');
+  row.className = 'ant-table-row';
+  row.getAttribute = k => (k in attrs ? attrs[k] : null);
+  row.setAttribute = (k, v) => { attrs[k] = v; };
+  row.hasAttribute = k => k in attrs;
+  row.removeAttribute = k => { delete attrs[k]; };
+  row.querySelectorAll = sel => (sel === 'td' ? tds : []);
+  row.closest = sel => (sel === '.ant-table-row' ? row : null);
+  row.tds = tds;
+  return row;
+}
+
+function createEnv({ pathname = '/home', withForm = false, layout = null, table = null } = {}) {
   const logs = [];
   const timers = [];
   const fetchCalls = [];
@@ -45,7 +104,7 @@ function createEnv({ pathname = '/home', withForm = false } = {}) {
 
   if (withForm) {
     const form = makeElement('form');
-    const btn = makeElement('button');
+    const btn = makeElement('button', layout ? layout.ref : null);
     btn.textContent = '重置';
     btn.parentElement = makeElement('div');
     btn.parentElement.insertAdjacentElement = (_pos, node) => {
@@ -55,6 +114,7 @@ function createEnv({ pathname = '/home', withForm = false } = {}) {
     forms.push(form);
   }
 
+  const tables = table ? [makeTable(table)] : [];
   const document = {
     readyState: 'complete',
     cookie: '',
@@ -62,9 +122,13 @@ function createEnv({ pathname = '/home', withForm = false } = {}) {
     head,
     documentElement: makeElement('html'),
     getElementById: () => null,
-    createElement: tag => makeElement(tag),
-    querySelector: sel => (sel === '.qsb-filter-bar' ? bar.value : null),
-    querySelectorAll: sel => (sel === '.ant-form' ? forms : []),
+    createElement: tag => makeElement(tag, layout && String(tag).toUpperCase() === 'INPUT' ? layout.input : null),
+    querySelector: sel => (sel === '.qsb-filter-bar' ? bar.value : sel === '.ant-table' ? (tables[0] || null) : null),
+    querySelectorAll: sel => {
+      if (sel === '.ant-form') return forms;
+      if (sel === '.ant-table') return tables;
+      return [];
+    },
     addEventListener() { },
     removeEventListener() { },
   };
@@ -130,6 +194,7 @@ function createEnv({ pathname = '/home', withForm = false } = {}) {
     fetchCalls,
     FakeXHR,
     bar,
+    get table() { return tables[0] || null; },
     get cloneCalls() { return cloneCalls; },
     boot() { vm.runInContext(SRC, context); flush(); },
     run() { vm.runInContext(SRC, context); },
@@ -185,6 +250,44 @@ test('路由：只在目标页激活，同路径重复跳转不重复激活', ()
   env.push(`${TARGET}?tab=2`);
   assert.equal(countLogs(env.logs, '目标页面已激活'), 1);
   assert.equal(countLogs(env.logs, '筛选栏已注入'), 1);
+});
+
+test('筛选栏：高度与垂直中心按同行原生控件实测值校正', () => {
+  // 站点控件 36px 高（top 100），脚本写死 32px、还低了一截（top 114）
+  const env = createEnv({
+    pathname: TARGET,
+    withForm: true,
+    layout: { ref: { top: 100, height: 36 }, input: { top: 114, height: 32 } },
+  });
+  env.boot();
+
+  const bar = env.bar.value;
+  assert.ok(bar, '筛选栏应已注入');
+  const input = bar.children[0].children[0];   // inputWrap > input
+  assert.equal(input.style.height, '36px', '高度应跟随主题控件，而不是写死 32px');
+  assert.equal(bar.style.top, '-12px', '中心线差 12px，应整体上移补偿');
+});
+
+test('状态列归属：只绑「取数执行」列，「数据入库」的“失败”不算状态格', () => {
+  const env = createEnv({
+    pathname: TARGET,
+    withForm: true,
+    table: {
+      headers: ['计划名称', '店铺', '最近运行开始时间', '最近运行结束时间', '取数执行', '数据入库', '数据校验', '操作'],
+      rows: [
+        // 取数执行=已完成，但数据入库是"失败"——旧实现会把这格当成状态格
+        { key: 'job-a', cells: ['计划A', '店铺A', '10:00', '10:01', '已完成', '失败', '-', '运行详情'] },
+        { key: 'job-b', cells: ['计划B', '店铺B', '10:02', '10:03', '运行失败', '失败', '-', '运行详情'] },
+      ],
+    },
+  });
+  env.boot();
+
+  const [rowA, rowB] = env.table.rows;
+  assert.equal(rowA.tds[4].getAttribute('data-job-uuid'), null, '已完成 不挂浮层');
+  assert.equal(rowA.tds[5].getAttribute('data-job-uuid'), null, '数据入库 不得被当成状态格');
+  assert.equal(rowB.tds[4].getAttribute('data-job-uuid'), 'job-b', '运行失败 应绑到取数执行列');
+  assert.equal(rowB.tds[5].getAttribute('data-job-uuid'), null, '数据入库 仍不得被误绑');
 });
 
 test('路由：离开后清空激活态，再回来重新激活', () => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         取数宝-任务运行记录助手
 // @namespace    https://dep.ai-indeed.com/qsb-taskexecute-helper
-// @version      1.0.6
+// @version      1.0.7
 // @description  店铺级即时筛选 + 运行异常分类外显（悬浮秒出）
 // @author       青藤
 // @match        https://dep.ai-indeed.com/*
@@ -18,7 +18,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qsb-taskexecute-helper.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.0.6';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.0.7';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const ROUTE_POLL_MS = 1000;          // 路由变化兜底轮询间隔
   const API_BASE = '/frameWorkPortal/opt/qymall/1.0.0';
@@ -180,6 +180,7 @@
         gap: 8px;
         margin-left: 12px;
         vertical-align: middle;
+        position: relative;   /* 供 alignFilterBar() 用 top 做垂直微调 */
       }
       /* 作为 ant-form-item 包装时的样式，保证与左侧重置按钮严格水平对齐 */
       .ant-form-item.qsb-filter-form-item {
@@ -336,7 +337,10 @@
         align-items: center;
         gap: 5px;
         margin-left: 6px;
-        vertical-align: middle;
+        /* 用基线对齐：圆球里的数字与"运行失败"这类状态文字坐在同一条基线上。
+           之前是 vertical-align: middle —— 它对齐的是"基线 + 半个 x-height"，
+           比文字视觉中心低约半个字高，圆球看着就往下掉了一截。 */
+        vertical-align: baseline;
       }
       .qsb-bar-seg {
         display: inline-flex;
@@ -369,19 +373,73 @@
   // ═══════════════════════════════════════════════════════════════
   let filterInput = null;
   let countBadge = null;
+  let filterAnchorBtn = null;      // 同行的原生控件，垂直对齐的唯一可信基准
+  let alignHooked = false;
+
+  /** 顶栏 ant-form 里的"重置"按钮：既是注入位置，也是对齐全高/中心的基准 */
+  function findAnchorButton() {
+    for (const form of document.querySelectorAll('.ant-form')) {
+      for (const btn of form.querySelectorAll('button')) {
+        const text = btn.textContent.trim().replace(/\s+/g, '');
+        if (text === '重置') return btn;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 把筛选栏对齐到同行原生控件。
+   * 站点的控件高度来自主题（实测 36px），脚本里写死 32px 就比同行矮一截；
+   * 自建的 .ant-form-item 外壳又脱离了 antd 的 flex 行布局，垂直居中对不上，
+   * 于是筛选框比左边一排控件低十几像素、且更矮 —— 看着就是"没平行"。
+   * 这里不猜像素：以基准控件的实测矩形为准，先对齐高度，再补偿中心线偏差。
+   * 每次都是"归零后重新量"，所以反复调用不会累积漂移。
+   */
+  function alignFilterBar() {
+    const bar = document.querySelector('.qsb-filter-bar');
+    if (!bar || !filterInput) return;
+    const ref = (filterAnchorBtn && filterAnchorBtn.isConnected)
+      ? filterAnchorBtn
+      : (filterAnchorBtn = findAnchorButton());
+    if (!ref) return;
+    // 没有布局信息（测试桩 / 隐藏容器）时直接跳过，别把异常抛到定时器里
+    if (typeof ref.getBoundingClientRect !== 'function'
+      || typeof filterInput.getBoundingClientRect !== 'function') return;
+
+    const refRect = ref.getBoundingClientRect();
+    if (!refRect.height) return;                 // 还没布局，等下一次调度
+
+    const h = Math.round(refRect.height);
+    if (filterInput.style.height !== h + 'px') filterInput.style.height = h + 'px';
+
+    // 先把偏移归零再量，量到的是"原始位置"：算多少次结果都一样，不会累积漂移
+    bar.dataset.qsbOffsetY = '0';
+    bar.style.top = '0px';
+    const inputRect = filterInput.getBoundingClientRect();
+    const dy = (refRect.top + refRect.height / 2) - (inputRect.top + inputRect.height / 2);
+    const next = Math.round(Math.max(-40, Math.min(40, dy)) * 10) / 10;
+    bar.dataset.qsbOffsetY = String(next);
+    bar.style.top = next + 'px';
+  }
+
+  /** 注入当帧、字体/主题重排后各校一次；窗口尺寸变化再校一次（监听只装一遍） */
+  function scheduleAlign() {
+    const raf = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame
+      : (fn) => setTimeout(fn, 0);
+    raf(() => alignFilterBar());
+    setTimeout(alignFilterBar, 300);
+    setTimeout(alignFilterBar, 1000);
+    if (alignHooked) return;
+    alignHooked = true;
+    window.addEventListener('resize', () => alignFilterBar(), { passive: true });
+  }
 
   function injectFilterBar() {
     if (document.querySelector('.qsb-filter-bar')) return true;
 
     // 在顶部 ant-form 的"重置"按钮右侧注入
-    let anchorBtn = null;
-    for (const form of document.querySelectorAll('.ant-form')) {
-      for (const btn of form.querySelectorAll('button')) {
-        const text = btn.textContent.trim().replace(/\s+/g, '');
-        if (text === '重置') { anchorBtn = btn; break; }
-      }
-      if (anchorBtn) break;
-    }
+    const anchorBtn = findAnchorButton();
     if (!anchorBtn) return false;
 
     const container = document.createElement('span');
@@ -435,6 +493,10 @@
     } else {
       anchorBtn.parentElement.insertAdjacentElement('afterend', container);
     }
+
+    // 挂上去之后再拿实测矩形校正高度与中心线（写死的 CSS 尺寸在换主题后必然偏）
+    filterAnchorBtn = anchorBtn;
+    scheduleAlign();
 
     // 监听输入（150ms 防抖）
     let debounceTimer = null;
@@ -887,22 +949,61 @@
     }
   }
 
+  // ── 状态列定位 ────────────────────────────────────────────────
+  // 状态与异常只属于「取数执行」一列。旧实现是"哪个单元格的文本含'失败'就认哪个"，
+  // 而「数据入库」「数据校验」列同样会出现"失败"，于是"取数执行=已完成"的行
+  // 会把「数据入库」误判成状态格：鼠标停上去冒浮层、色球也可能挂错列。
+  // 悬停时每次 mouseover 都会问一次，按表格元素缓存（表格被重建则自动失效）
+  let _statusColCache = { table: null, idx: -1 };
+
+  function findStatusColumnIndex() {
+    const mainTable = getMainTable();
+    if (!mainTable) return -1;
+    if (_statusColCache.table === mainTable) return _statusColCache.idx;
+
+    const ths = mainTable.querySelectorAll('.ant-table-thead th');
+    let idx = -1;
+    for (let i = 0; i < ths.length; i++) {
+      if (ths[i].textContent.replace(/\s+/g, '').includes('取数执行')) { idx = i; break; }
+    }
+    if (idx < 0) return -1;              // 表头还没渲染出来：不缓存，下次再找
+    _statusColCache = { table: mainTable, idx };
+    return idx;
+  }
+
+  const STATUS_TEXT_HINTS = ['运行失败', '运行中', '待运行', '失败', '停止'];
+
+  /** 行内的状态格；「已完成」返回 null（没有异常可看，也不挂浮层） */
+  function getStatusCell(row) {
+    if (!row) return null;
+    const cells = row.querySelectorAll('td');
+    const idx = findStatusColumnIndex();
+
+    if (idx >= 0) {
+      const td = cells[idx];
+      if (!td) return null;
+      if (td.querySelector?.('.qsb-status-bar')) return td;
+      const text = td.textContent.replace(/\s+/g, '');
+      if (text.includes('已完成') || text === '完成' || text === '运行完成') return null;
+      return STATUS_TEXT_HINTS.some(h => text.includes(h)) ? td : null;
+    }
+
+    // 表头还没渲染出来的瞬间：退回文本探测，但要求格内有状态角标，
+    // 避免把「数据入库」这类纯文字"失败"当成状态格
+    for (const td of cells) {
+      const text = td.textContent.replace(/\s+/g, '');
+      if (text.includes('已完成') || text === '完成') continue;
+      if (!STATUS_TEXT_HINTS.some(h => text.includes(h))) continue;
+      if (td.querySelector?.('.ant-badge, .ant-tag, .ant-badge-status, .qsb-status-bar')) return td;
+    }
+    return null;
+  }
+
   function renderBarInRow(row, jobUuid) {
     const cached = errorCache.get(jobUuid);
     if (!cached) return;
 
-    // 查找取数执行单元格
-    const cells = row.querySelectorAll('td');
-    let targetCell = null;
-    for (const cell of cells) {
-      const txt = cell.textContent.trim();
-      if (txt.includes('运行失败') || txt.includes('失败') ||
-        txt.includes('运行中') || txt.includes('待运行') ||
-        txt.includes('停止') || txt.includes('已停止')) {
-        targetCell = cell;
-        break;
-      }
-    }
+    const targetCell = getStatusCell(row);
     if (!targetCell) return;
 
     let barEl = targetCell.querySelector('.qsb-status-bar');
@@ -977,35 +1078,29 @@
       const jobUuid = extractJobUuid(row);
       if (!jobUuid) return;
 
-      // 查找"取数执行"状态列：包含失败/运行中/待运行文本的 td
-      const cells = row.querySelectorAll('td');
-      for (let i = 0; i < cells.length; i++) {
-        const td = cells[i];
-        const text = td.textContent.trim();
-        // 匹配非完成的状态标签（注意：“已完成”不绑定）
-        if (text.includes('已完成') || text === '完成' || text === '运行完成') {
-          // 确保已完成的标签单元格内绝对没有残留的色球
-          const bar = td.querySelector('.qsb-status-bar');
-          if (bar) bar.remove();
-          td.classList.remove('qsb-status-cell');
-          td.removeAttribute('data-job-uuid');
-          continue;
-        }
-        if (text.includes('运行失败') || text.includes('失败') ||
-          text.includes('运行中') || text.includes('待运行') ||
-          text.includes('停止') || text.includes('已停止')) {
-          td.classList.add('qsb-status-cell');
-          td.setAttribute('data-job-uuid', jobUuid);
-          td.style.cursor = 'pointer';
-          renderBarInRow(row, jobUuid);
-          break;
-        }
-      }
+      // 只认「取数执行」列；「已完成」的格子不挂浮层
+      const td = getStatusCell(row);
+
+      // 清掉旧实现可能误标在别的列（数据入库等）上的痕迹
+      row.querySelectorAll('td').forEach(cell => {
+        if (cell === td) return;
+        const stale = cell.querySelector?.('.qsb-status-bar');
+        if (stale) stale.remove();
+        cell.classList.remove('qsb-status-cell');
+        cell.removeAttribute('data-job-uuid');
+      });
+
+      if (!td) return;
+      td.classList.add('qsb-status-cell');
+      td.setAttribute('data-job-uuid', jobUuid);
+      td.style.cursor = 'pointer';
+      renderBarInRow(row, jobUuid);
     });
   }
 
   /**
    * 动态识别主表格内的状态单元格（抗 Vue/React 重新渲染抹除 class）
+   * 判据只有一条：它是本行「取数执行」列的那一格 —— 不再靠"文本里有失败"猜。
    */
   function findStatusCell(target) {
     if (!target) return null;
@@ -1016,22 +1111,7 @@
     const row = td.closest?.('.ant-table-row');
     if (!row || row.closest?.('.ant-modal, .ant-drawer')) return null;
 
-    // 1. 已有标记
-    if (td.classList?.contains('qsb-status-cell') || td.hasAttribute('data-job-uuid')) {
-      return td;
-    }
-
-    // 2. 动态探测文本包含异常或运行状态
-    const text = td.textContent.trim();
-    if (text.includes('已完成') || text === '完成' || text === '运行完成') return null;
-
-    if (text.includes('运行失败') || text.includes('失败') ||
-      text.includes('运行中') || text.includes('待运行') ||
-      text.includes('停止') || text.includes('已停止') ||
-      td.querySelector?.('.qsb-status-bar')) {
-      return td;
-    }
-    return null;
+    return getStatusCell(row) === td ? td : null;
   }
 
   let globalHoverTimer = null;
@@ -1543,6 +1623,7 @@
     teardown() {
       filterInput = null;         // 页码/筛选框句柄随 DOM 一起失效，清空避免跨页残留
       countBadge = null;
+      filterAnchorBtn = null;
       resetPreloadState();        // 中断预加载并关闭浮层
     }
   });
