@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.1.2
+// @version      1.1.3
 // @description  任务运行记录店铺筛选与异常外显 + 数据中心表字段导出 Excel
 // @author       青藤
+// @icon         http://dep-cloud-fe-ops.ii-ai.tech/favicon.png
 // @match        https://dep.ai-indeed.com/*
 // @updateURL    https://ivy-reverie-vine.github.io/qushubao-userscripts/qushubao-userscripts.user.js
 // @downloadURL  https://ivy-reverie-vine.github.io/qushubao-userscripts/qushubao-userscripts.user.js
@@ -18,7 +19,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.1.2';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.1.3';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
   const ROUTE_POLL_MS = 1000;          // 路由变化兜底轮询间隔
