@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.1.1
+// @version      1.1.2
 // @description  任务运行记录店铺筛选与异常外显 + 数据中心表字段导出 Excel
 // @author       青藤
 // @match        https://dep.ai-indeed.com/*
@@ -18,7 +18,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.1.1';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.1.2';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
   const ROUTE_POLL_MS = 1000;          // 路由变化兜底轮询间隔
@@ -1590,7 +1590,9 @@
   const XLSX_HEADER = ['字段英文名', '字段中文名', '数据类型', '长度'];
 
   // 三个样式位：0=正文(宋体11) 1=标题(宋体12+浅蓝底) 2=表头(宋体11加粗)
+  // 1/2 都挂黑色细边框，让前四行（3 行标题 + 1 行表头）自成一个有框的表头区。
   // cellStyles 那一段不能少，否则部分解析器报「缺少默认样式」
+  // border 子元素顺序必须是 left/right/top/bottom，乱了 Excel 会拒开。
   const XLSX_STYLES = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
     + '<fonts count="3">'
@@ -1603,12 +1605,20 @@
     + '<fill><patternFill patternType="gray125"/></fill>'
     + '<fill><patternFill patternType="solid"><fgColor rgb="FFDDEBF7"/><bgColor indexed="64"/></patternFill></fill>'
     + '</fills>'
-    + '<borders count="1"><border/></borders>'
+    + '<borders count="2">'
+    + '<border/>'
+    + '<border>'
+    + '<left style="thin"><color rgb="FF000000"/></left>'
+    + '<right style="thin"><color rgb="FF000000"/></right>'
+    + '<top style="thin"><color rgb="FF000000"/></top>'
+    + '<bottom style="thin"><color rgb="FF000000"/></bottom>'
+    + '</border>'
+    + '</borders>'
     + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
     + '<cellXfs count="3">'
     + '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
-    + '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
-    + '<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+    + '<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>'
+    + '<xf numFmtId="0" fontId="2" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1"/>'
     + '</cellXfs>'
     + '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
     + '</styleSheet>';
@@ -1628,7 +1638,11 @@
     const titleRow = text => {
       r++;
       merges.push(`A${r}:D${r}`);
-      lines.push(`<row r="${r}">${xlsxCell(0, r, text, 1)}</row>`);
+      // A:D 四个格子都套同一套样式：合并区域的外框右/下边是靠 D 列那格画的，
+      // 只给 A 列设样式时某些渲染器会缺右边框。合并会把内部竖线吃掉，不会露出来。
+      lines.push(`<row r="${r}">`
+        + [text, '', '', ''].map((value, i) => xlsxCell(i, r, value, 1)).join('')
+        + '</row>');
     };
     titleRow(`连接器名称：${block.connectorName || ''}`);
     titleRow(`中文表名：${block.tableNameCn || ''}`);
