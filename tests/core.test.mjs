@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const SRC = fs.readFileSync(new URL('../qsb-taskexecute-helper.user.js', import.meta.url), 'utf8');
+const SRC = fs.readFileSync(new URL('../qushubao-userscripts.user.js', import.meta.url), 'utf8');
 const TARGET = '/mallQuan/taskExecuteManagementV2';
 
 function makeElement(tag = 'div', rect = null) {
