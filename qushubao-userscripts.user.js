@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.1.3
-// @description  任务运行记录店铺筛选与异常外显 + 数据中心表字段导出 Excel
+// @version      1.2.0
+// @description  任务运行记录店铺筛选与异常外显 + 数据中心表字段导出 Excel / 启用表名复制
 // @author       青藤
 // @icon         http://dep-cloud-fe-ops.ii-ai.tech/favicon.png
 // @match        https://dep.ai-indeed.com/*
@@ -19,7 +19,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.1.3';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.2.0';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
   const ROUTE_POLL_MS = 1000;          // 路由变化兜底轮询间隔
@@ -382,6 +382,40 @@
         padding-left: 8px;
         padding-right: 8px;
       }
+
+      /* 数据中心：表头「复制启用表名」按钮（复用 .qsb-copy-btn 的外观，只压尺寸） */
+      .qsb-copy-btn.qsb-copy-btn--th {
+        margin-left: 6px;
+        padding: 0 5px;
+        font-size: 11px;
+        line-height: 16px;
+        font-weight: 400;
+        vertical-align: 1px;
+        white-space: nowrap;
+      }
+      /* 剪贴板被拒时的兜底面板：只展示、不自动写剪贴板 */
+      .qsb-copy-panel {
+        position: fixed; z-index: 100001;
+        top: 50%; left: 50%; transform: translate(-50%, -50%);
+        width: 520px; max-width: 90vw;
+        background: #fff; color: #333;
+        border: 1px solid #e8e8e8; border-radius: 6px;
+        box-shadow: 0 6px 24px rgba(0,0,0,0.2);
+        padding: 14px 16px;
+        font-size: 13px; line-height: 1.6;
+      }
+      .qsb-copy-panel-title { font-weight: 600; margin-bottom: 8px; }
+      .qsb-copy-panel textarea {
+        width: 100%; height: 260px; margin-bottom: 10px;
+        padding: 8px; box-sizing: border-box;
+        border: 1px solid #d9d9d9; border-radius: 4px;
+        font-family: Consolas, Menlo, monospace; font-size: 12px; line-height: 1.6;
+        resize: vertical;
+      }
+      .qsb-copy-panel-foot {
+        display: flex; align-items: center; justify-content: space-between;
+      }
+      .qsb-copy-panel-count { color: #8c8c8c; font-size: 12px; }
     `;
     document.head.appendChild(style);
   }
@@ -1901,12 +1935,26 @@
   let exportObserver = null;
   let exportInjectTimer = null;
 
+  /** 表头纯文字：扣掉自己塞进去的按钮节点，否则 headerIndex 再也匹配不上原文 */
+  function headerText(th) {
+    if (!th) return '';
+    const nodes = th.childNodes;
+    if (!nodes || !nodes.length) return (th.textContent || '').trim();   // 桩环境 / 无子节点
+    let out = '';
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      if (node.nodeType === 1 && node.dataset && node.dataset.qsbCopy) continue;   // 本脚本的复制按钮
+      out += node.textContent || '';
+    }
+    return out.trim();
+  }
+
   /** 按表头文字取列索引：站点调列序不会指错 */
   function headerIndex(scope, label) {
     if (!scope) return -1;
     const ths = scope.querySelectorAll('thead th');
     for (let i = 0; i < ths.length; i++) {
-      if (ths[i].textContent.trim() === label) return i;
+      if (headerText(ths[i]) === label) return i;
     }
     return -1;
   }
@@ -2075,8 +2123,185 @@
     }
   }
 
-  function onExportClick(e) {
-    const btn = e.target.closest && e.target.closest('.qsb-export-btn');
+  // ───────────────────────────────────────────────────────────────
+  // 「复制启用表名」：嵌套表表头 表中文名称 / 表英文名称 各塞一个按钮。
+  // 纯 DOM 读取，不请求接口。启用状态读 ant-switch 的 aria-checked（实测形态），
+  // 换 checkbox / 文字也能兜住；三级全落空时不静默猜，照抄全部并在反馈里标出。
+  // ───────────────────────────────────────────────────────────────
+  const COPYNAME_LABEL = '复制';
+  const COPYNAME_COLS = [
+    { kind: 'cn', label: '表中文名称' },
+    { kind: 'en', label: '表英文名称' }
+  ];
+  const ENABLED_COL_LABEL = '是否启用';
+
+  /** 启用状态三态：true=启用 / false=停用 / null=认不出 */
+  function readEnabledState(cell) {
+    if (!cell) return null;
+    const sw = cell.querySelector('[role="switch"]') || cell.querySelector('.ant-switch');
+    if (sw) {
+      const aria = sw.getAttribute('aria-checked');
+      if (aria === 'true') return true;
+      if (aria === 'false') return false;
+      if (sw.classList && sw.classList.contains('ant-switch-checked')) return true;
+      if (sw.classList && sw.classList.contains('ant-switch')) return false;
+    }
+    const box = cell.querySelector('input[type="checkbox"]');
+    if (box) return !!box.checked;
+    const text = (cell.textContent || '').replace(/\s+/g, '');
+    if (!text) return null;
+    if (/未启用|不启用|停用|禁用|关闭/.test(text)) return false;
+    if (/启用|开启|正常|^是$/.test(text)) return true;
+    return null;
+  }
+
+  /** 一张嵌套表 → 某列在「启用」行上的表名（表格行序，未去重） */
+  function collectTableNames(table, kind) {
+    const colIdx = headerIndex(table, kind === 'en' ? '表英文名称' : '表中文名称');
+    if (colIdx < 0) return { names: [], unrecognized: false };
+    const stateIdx = headerIndex(table, ENABLED_COL_LABEL);
+    const names = [];
+    let unrecognized = stateIdx < 0;      // 连「是否启用」列都找不到，口径已不可信
+    for (const row of table.querySelectorAll('tbody tr.ant-table-row')) {
+      const cells = row.querySelectorAll('td');
+      const cell = cells[colIdx];
+      if (!cell) continue;
+      const name = (cell.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!name) continue;
+      if (stateIdx >= 0) {
+        const state = readEnabledState(cells[stateIdx]);
+        if (state === false) continue;
+        if (state === null) unrecognized = true;
+      }
+      names.push(name);
+    }
+    return { names, unrecognized };
+  }
+
+  /** onlyTable 给了就只扫这一张（Alt+点击），否则扫全页所有已展开的嵌套表 */
+  function collectEnabledNames(kind, onlyTable) {
+    const tables = onlyTable
+      ? [onlyTable]
+      : Array.from(document.querySelectorAll('.ant-table-expanded-row table'));
+    const names = [];
+    const seen = new Set();
+    let unrecognized = false;
+    for (const table of tables) {
+      const one = collectTableNames(table, kind);
+      if (one.unrecognized) unrecognized = true;
+      for (const name of one.names) {
+        if (seen.has(name)) continue;   // 跨连接器重名表：纯名单里重复没有意义
+        seen.add(name);
+        names.push(name);
+      }
+    }
+    return { names, unrecognized, tableCount: tables.length };
+  }
+
+  /** 写剪贴板三级降级：Clipboard API → execCommand → 可手动复制的面板 */
+  async function copyText(text) {
+    try {
+      if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) { /* 权限被拒 → 降级 */ }
+
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0;';
+      document.body.appendChild(ta);
+      ta.select();
+      if (ta.setSelectionRange) ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand('copy');
+      ta.remove();
+      if (ok) return true;
+    } catch (_) { /* 再降级 */ }
+
+    showCopyPanel(text);
+    return false;
+  }
+
+  function showCopyPanel(text) {
+    document.querySelectorAll('.qsb-copy-panel').forEach(el => el.remove());
+    const box = document.createElement('div');
+    box.className = 'qsb-copy-panel';
+    box.innerHTML = '<div class="qsb-copy-panel-title">剪贴板不可用，请手动复制（Ctrl+C）</div>'
+      + '<textarea readonly></textarea>'
+      + '<div class="qsb-copy-panel-foot">'
+      + '<span class="qsb-copy-panel-count"></span>'
+      + '<button type="button" class="ant-btn ant-btn-primary ant-btn-sm qsb-copy-panel-close">关闭</button>'
+      + '</div>';
+
+    const ta = box.querySelector('textarea');
+    ta.value = text;
+    box.querySelector('.qsb-copy-panel-count').textContent =
+      `${text.split('\n').filter(Boolean).length} 条`;
+    box.querySelector('.qsb-copy-panel-close').addEventListener('click', () => box.remove());
+
+    document.body.appendChild(box);
+    ta.focus();
+    ta.select();
+  }
+
+  function flashCopyBtn(btn, text, ms) {
+    clearTimeout(btn._qsbCopyTimer);
+    btn.textContent = text;
+    btn.classList.add('copied');
+    btn._qsbCopyTimer = setTimeout(() => {
+      if (btn.isConnected === false) return;
+      btn.textContent = COPYNAME_LABEL;
+      btn.classList.remove('copied');
+    }, ms || 1600);
+  }
+
+  async function handleCopyNameClick(btn, onlyTable) {
+    const kind = btn.dataset.qsbCopy === 'en' ? 'en' : 'cn';
+    const { names, unrecognized, tableCount } = collectEnabledNames(kind, onlyTable);
+    if (!names.length) {
+      flashCopyBtn(btn, '无启用表');
+      return;
+    }
+    console.log(LOG_TAG, `复制启用表${kind === 'en' ? '英文' : '中文'}名 ${names.length} 条`
+      + `（扫描 ${tableCount} 张表${unrecognized ? '，含启用状态未识别的行' : ''}）`, names);
+
+    const ok = await copyText(names.join('\n'));
+    flashCopyBtn(btn, ok ? `已复制 ${names.length} 条` : `请手动复制 ${names.length} 条`, 2200);
+  }
+
+  function injectCopyNameButtons() {
+    for (const table of document.querySelectorAll('.ant-table-expanded-row table')) {
+      const ths = table.querySelectorAll('thead th');
+      for (const { kind, label } of COPYNAME_COLS) {
+        const idx = headerIndex(table, label);
+        if (idx < 0) continue;
+        const th = ths[idx];
+        if (!th || th.querySelector('button[data-qsb-copy]')) continue;
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'qsb-copy-btn qsb-copy-btn--th';
+        btn.dataset.qsbCopy = kind;
+        btn.textContent = COPYNAME_LABEL;
+        btn.title = `复制全页所有「启用」表的${label}；Alt+点击只复制本表`;
+        th.appendChild(btn);
+      }
+    }
+  }
+
+  function onDataCenterClick(e) {
+    const target = e.target;
+    const copyBtn = target.closest && target.closest('button[data-qsb-copy]');
+    if (copyBtn) {
+      e.preventDefault();
+      e.stopPropagation();        // 别让 antd 的头/行点击逻辑跟着响应
+      handleCopyNameClick(copyBtn, e.altKey ? copyBtn.closest('table') : null);
+      return;
+    }
+
+    const btn = target.closest && target.closest('.qsb-export-btn');
     if (!btn) return;
     e.preventDefault();
     e.stopPropagation();          // 别让 antd 的行点击/展开逻辑跟着响应
@@ -2091,25 +2316,30 @@
       // enterPage 在同一路由内会被重复调用，这里必须幂等
       if (!state.exportReady) {
         state.exportReady = true;
-        document.addEventListener('click', onExportClick, true);
+        document.addEventListener('click', onDataCenterClick, true);
         if (!exportObserver) {
           exportObserver = new MutationObserver(() => {
             clearTimeout(exportInjectTimer);
-            exportInjectTimer = setTimeout(injectExportColumns, 300);
+            exportInjectTimer = setTimeout(() => {
+              injectExportColumns();
+              injectCopyNameButtons();
+            }, 300);
           });
           exportObserver.observe(document.body, { childList: true, subtree: true });
         }
-        console.log(LOG_TAG, '数据中心：导出列已接管');
+        console.log(LOG_TAG, '数据中心：导出列 + 启用表名复制已接管');
       }
       injectExportColumns();
+      injectCopyNameButtons();
     },
     teardown(state) {
       state.exportReady = false;
-      document.removeEventListener('click', onExportClick, true);
+      document.removeEventListener('click', onDataCenterClick, true);
       clearTimeout(exportInjectTimer);
       if (exportObserver) { exportObserver.disconnect(); exportObserver = null; }
       tableDefCache.clear();
-      document.querySelectorAll('[data-qsb-export]').forEach(el => el.remove());
+      document.querySelectorAll('[data-qsb-export], button[data-qsb-copy], .qsb-copy-panel')
+        .forEach(el => el.remove());
     }
   });
 
