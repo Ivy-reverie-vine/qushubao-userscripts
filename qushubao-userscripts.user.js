@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.2.0
-// @description  任务运行记录店铺筛选与异常外显 + 数据中心表字段导出 Excel / 启用表名复制
+// @version      1.3.0
+// @description  任务运行记录店铺筛选与异常外显 + 数据中心表字段导出 Excel（单表 / 连接器多 Sheet）与启用表名复制
 // @author       青藤
 // @icon         http://dep-cloud-fe-ops.ii-ai.tech/favicon.png
 // @match        https://dep.ai-indeed.com/*
@@ -19,7 +19,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.2.0';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.3.0';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
   const ROUTE_POLL_MS = 1000;          // 路由变化兜底轮询间隔
@@ -381,6 +381,19 @@
         white-space: nowrap;
         padding-left: 8px;
         padding-right: 8px;
+      }
+
+      /* 数据中心：表头「导出Excel」做成可点的文字入口（导出本连接器全部启用表） */
+      .qsb-export-all {
+        color: #1890ff;
+        cursor: pointer;
+        user-select: none;
+      }
+      .qsb-export-all:hover { color: #40a9ff; text-decoration: underline; }
+      .qsb-export-all[data-qsb-busy='1'] {
+        color: #8c8c8c;
+        cursor: default;
+        text-decoration: none;
       }
 
       /* 数据中心：表头「复制启用表名」按钮（复用 .qsb-copy-btn 的外观，只压尺寸） */
@@ -1709,8 +1722,23 @@
       + '</worksheet>';
   }
 
-  /** 单表单 sheet 工作簿 → Uint8Array */
-  function buildXlsx(block, sheetName) {
+  /**
+   * 多 sheet 工作簿：sheets = [{ name, block }] → Uint8Array
+   * 部件顺序：sheet1..sheetN 依次拿 rId1..rIdN，styles 固定排最后（rId N+1），
+   * workbook.xml 里的 r:id 与 rels 必须一一对上，否则 Excel 报「内容有问题」。
+   */
+  function buildWorkbook(sheets) {
+    const sheetParts = sheets.map((s, i) => {
+      const no = i + 1;
+      return {
+        rels: `<Relationship Id="rId${no}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${no}.xml"/>`,
+        type: `<Override PartName="/xl/worksheets/sheet${no}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`,
+        sheet: `<sheet name="${esc(s.name)}" sheetId="${no}" r:id="rId${no}"/>`,
+        part: { name: `xl/worksheets/sheet${no}.xml`, data: buildSheetXml(s.block) }
+      };
+    });
+    const styleRid = `rId${sheets.length + 1}`;
+
     const files = [
       {
         name: '[Content_Types].xml',
@@ -1720,7 +1748,7 @@
           + '<Default Extension="xml" ContentType="application/xml"/>'
           + '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
           + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-          + '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+          + sheetParts.map(p => p.type).join('')
           + '</Types>'
       },
       {
@@ -1735,20 +1763,20 @@
         data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
           + '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
           + ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-          + `<sheets><sheet name="${esc(sheetName)}" sheetId="1" r:id="rId1"/></sheets>`
+          + `<sheets>${sheetParts.map(p => p.sheet).join('')}</sheets>`
           + '</workbook>'
       },
       {
         name: 'xl/_rels/workbook.xml.rels',
         data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
           + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-          + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-          + '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+          + sheetParts.map(p => p.rels).join('')
+          + `<Relationship Id="${styleRid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`
           + '</Relationships>'
       },
-      { name: 'xl/styles.xml', data: XLSX_STYLES },
-      { name: 'xl/worksheets/sheet1.xml', data: buildSheetXml(block) }
-    ];
+      { name: 'xl/styles.xml', data: XLSX_STYLES }
+    ].concat(sheetParts.map(p => p.part));
+
     return zipStore(files);
   }
 
@@ -1756,6 +1784,19 @@
   function toSheetName(raw) {
     const s = String(raw || '').replace(/[\\/?*[\]:]/g, '_').trim();
     return (s || 'Sheet1').slice(0, 31);
+  }
+
+  /** Excel 要求 sheet 名不区分大小写唯一；重名追加 _2、_3…，仍守 31 字上限 */
+  function uniqueSheetName(raw, used) {
+    const base = toSheetName(raw);
+    let name = base;
+    let n = 2;
+    while (used.has(name.toLowerCase())) {
+      const suffix = `_${n++}`;
+      name = base.slice(0, 31 - suffix.length) + suffix;
+    }
+    used.add(name.toLowerCase());
+    return name;
   }
 
   /** 文件名里不能出现的字符；过长会撞 Windows 路径限制 */
@@ -2001,7 +2042,14 @@
         const th = document.createElement('th');
         th.className = anchorTh.className;
         th.setAttribute('data-qsb-export', '');
-        th.textContent = EXPORT_COL_LABEL;
+
+        // 表头文字本身就是入口：点它 = 导出本连接器所有启用表（每表一个 sheet）
+        const link = document.createElement('span');
+        link.className = 'qsb-export-all';
+        link.textContent = EXPORT_COL_LABEL;
+        link.title = '导出本连接器所有「启用」表的 ETL 配置（每张表一个 Sheet）';
+        th.appendChild(link);
+
         anchorTh.insertAdjacentElement('afterend', th);
       }
 
@@ -2062,16 +2110,16 @@
   }
 
   /**
-   * 两条路取表定义：先用行上的 data-row-key 当 connectorId 直接问；
+   * 取一个连接器的全部表定义：先用行上的 data-row-key 当 connectorId 直接问；
    * 取不到就用连接器全名在 connector/page 里精确匹配换 id 再问一次。
    * 行 key 是否等于 conn/mapper/get 的 connectorId 没有文档背书，所以必须有第二条路。
    */
-  async function resolveTableDef(connectorName, tableNameEn, tableNameCn, hintId) {
+  async function getConnectorTables(connectorName, hintId) {
     if (hintId) {
-      const hit = pickTable(await getTableDefs(hintId), tableNameEn, tableNameCn);
-      if (hit) return hit;
+      const tables = await getTableDefs(hintId);
+      if (tables.length) return tables;
     }
-    if (!connectorName) return null;
+    if (!connectorName) return [];
 
     const res = await apiPost('/connector/page', {
       pageSize: 20, pageNo: 1, connectorName,
@@ -2080,10 +2128,14 @@
     const records = (res && res.bizData && res.bizData.records) || [];
     for (const rec of records) {
       if (!rec || rec.connectorName !== connectorName || !rec.id) continue;
-      const hit = pickTable(await getTableDefs(String(rec.id)), tableNameEn, tableNameCn);
-      if (hit) return hit;
+      const tables = await getTableDefs(String(rec.id));
+      if (tables.length) return tables;
     }
-    return null;
+    return [];
+  }
+
+  async function resolveTableDef(connectorName, tableNameEn, tableNameCn, hintId) {
+    return pickTable(await getConnectorTables(connectorName, hintId), tableNameEn, tableNameCn);
   }
 
   async function exportTable(btn) {
@@ -2108,12 +2160,15 @@
 
       const cn = table.tableNameCn || tableNameCn;
       const en = table.tableNameEn || tableNameEn;
-      const bytes = buildXlsx({
-        connectorName: connectorName || cn,
-        tableNameCn: cn,
-        tableNameEn: en,
-        rows: fields.map(f => [f.fieldName, f.fieldComment, f.fieldAttr, f.fieldLength])
-      }, toSheetName(cn || en));
+      const bytes = buildWorkbook([{
+        name: toSheetName(cn || en),
+        block: {
+          connectorName: connectorName || cn,
+          tableNameCn: cn,
+          tableNameEn: en,
+          rows: fields.map(f => [f.fieldName, f.fieldComment, f.fieldAttr, f.fieldLength])
+        }
+      }]);
 
       downloadXlsx(bytes, `${toFileNamePart(cn || en)}_${toFileNamePart(en)}.xlsx`);
       setExportBtn(btn, '已导出', true, 1500);
@@ -2291,6 +2346,88 @@
     }
   }
 
+  /** 一张嵌套表 → 启用行的 { cn, en }（列按表头文字定位） */
+  function enabledTableRows(table) {
+    const cnIdx = headerIndex(table, '表中文名称');
+    const enIdx = headerIndex(table, '表英文名称');
+    const stateIdx = headerIndex(table, ENABLED_COL_LABEL);
+    const rows = [];
+    for (const row of table.querySelectorAll('tbody tr.ant-table-row')) {
+      const cells = row.querySelectorAll('td');
+      if (stateIdx >= 0 && readEnabledState(cells[stateIdx]) === false) continue;
+      const cn = cnIdx >= 0 && cells[cnIdx] ? (cells[cnIdx].textContent || '').trim() : '';
+      const en = enIdx >= 0 && cells[enIdx] ? (cells[enIdx].textContent || '').trim() : '';
+      if (!cn && !en) continue;
+      rows.push({ cn, en });
+    }
+    return rows;
+  }
+
+  function flashExportAll(link, text, busy, restoreMs) {
+    clearTimeout(link._qsbExportTimer);
+    link.textContent = text;
+    link.dataset.qsbBusy = busy ? '1' : '';
+    if (restoreMs) {
+      link._qsbExportTimer = setTimeout(() => {
+        if (link.isConnected === false) return;
+        link.textContent = EXPORT_COL_LABEL;
+        link.dataset.qsbBusy = '';
+      }, restoreMs);
+    }
+  }
+
+  /**
+   * 表头「导出Excel」：一个连接器的启用表 → 一个 xlsx，每张表一个 sheet。
+   * 表定义一次拿全（getConnectorTables 只发一次 conn/mapper/get），再按表名挑选，
+   * 所以 13 张表也只打 1 个请求。
+   */
+  async function exportEnabledTables(link) {
+    const table = link.closest('table');
+    const owner = table ? findOwnerRow(table) : { id: '', name: '' };
+    const rows = table ? enabledTableRows(table) : [];
+    if (!rows.length) {
+      flashExportAll(link, '无启用表');
+      return;
+    }
+
+    flashExportAll(link, '导出中…', true);
+    try {
+      const tables = await getConnectorTables(owner.name, owner.id);
+      const sheets = [];
+      const usedNames = new Set();
+      const missing = [];
+      for (const row of rows) {
+        const def = pickTable(tables, row.en, row.cn);
+        const fields = def && Array.isArray(def.fields) ? def.fields : [];
+        if (!fields.length) { missing.push(row.cn || row.en); continue; }
+        sheets.push({
+          name: uniqueSheetName(def.tableNameCn || row.cn || def.tableNameEn, usedNames),
+          block: {
+            connectorName: owner.name || '',
+            tableNameCn: def.tableNameCn || row.cn,
+            tableNameEn: def.tableNameEn || row.en,
+            rows: fields.map(f => [f.fieldName, f.fieldComment, f.fieldAttr, f.fieldLength])
+          }
+        });
+      }
+
+      if (missing.length) console.warn(LOG_TAG, '批量导出：以下启用表未取到字段，已跳过', missing);
+      if (!sheets.length) {
+        console.warn(LOG_TAG, '批量导出：启用表全部取不到字段定义', { connector: owner.name, rows });
+        flashExportAll(link, '未取到字段', false, 2500);
+        return;
+      }
+
+      downloadXlsx(buildWorkbook(sheets), `${toFileNamePart(owner.name || 'ETL配置')}.xlsx`);
+      flashExportAll(link,
+        missing.length ? `已导出 ${sheets.length} 表（跳过 ${missing.length}）` : `已导出 ${sheets.length} 表`,
+        false, 2500);
+    } catch (err) {
+      console.warn(LOG_TAG, '批量导出失败:', err);
+      flashExportAll(link, '导出失败', false, 2500);
+    }
+  }
+
   function onDataCenterClick(e) {
     const target = e.target;
     const copyBtn = target.closest && target.closest('button[data-qsb-copy]');
@@ -2298,6 +2435,15 @@
       e.preventDefault();
       e.stopPropagation();        // 别让 antd 的头/行点击逻辑跟着响应
       handleCopyNameClick(copyBtn, e.altKey ? copyBtn.closest('table') : null);
+      return;
+    }
+
+    const exportAll = target.closest && target.closest('.qsb-export-all');
+    if (exportAll) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (exportAll.dataset.qsbBusy === '1') return;
+      exportEnabledTables(exportAll);
       return;
     }
 

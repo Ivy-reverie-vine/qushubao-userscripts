@@ -8,7 +8,7 @@
 - 唯一产物：`qushubao-userscripts.user.js`（单文件 IIFE，`@grant none`，跑在页面上下文里）
 - 已实现页面：
   - `/mallQuan/taskExecuteManagementV2` —— 店铺名称即时筛选 + 运行异常分类外显（悬浮浮层）
-  - `/mallQuan/dataCenter` —— 展开行的表列表里加「导出Excel」列（按表导出字段映射 xlsx）+ 表头「复制」（把启用表的表中文/英文名按行复制进剪贴板）
+  - `/mallQuan/dataCenter` —— 展开行的表列表里加「导出Excel」列（按表导出字段映射 xlsx）；列名本身就是入口：点表头「导出Excel」= 导出该连接器所有启用表（多 Sheet，文件名=连接器名）；表头「复制」= 把启用表的中文/英文名按行复制进剪贴板
 - **不要**引入打包器、框架或 npm 依赖。发布形态永远是单文件 `.user.js`；文件长到需要拆分时再谈工具链，不要提前上。
 
 ## 上游接口文档去哪找
