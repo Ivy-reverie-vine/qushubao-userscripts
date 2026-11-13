@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.3.0
+// @version      1.3.1
 // @description  任务运行记录店铺筛选与异常外显 + 数据中心表字段导出 Excel（单表 / 连接器多 Sheet）与启用表名复制
 // @author       青藤
 // @icon         http://dep-cloud-fe-ops.ii-ai.tech/favicon.png
@@ -19,7 +19,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.3.0';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.3.1';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
   const ROUTE_POLL_MS = 1000;          // 路由变化兜底轮询间隔
@@ -49,9 +49,98 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  // 全局状态
+  // 全局状态与持久化缓存
   // ═══════════════════════════════════════════════════════════════
-  const errorCache = new Map();         // jobUuid -> { loading, text, details, counts }
+  const errorCache = new Map();         // key(date:jobUuid) -> { loading, text, details, counts, lastStartTime, lastEndTime }
+  const workCache = new Map();          // workUuid -> Array<workBlock>
+  let currentViewDate = '';             // 当前视图查询日期（YYYY-MM-DD）
+  let postListBindTimer = null;         // 列表接口返回后的延迟绑定定时器
+  const WORK_CACHE_PREFIX = 'qsb_work_';
+  const JOB_CACHE_PREFIX = 'qsb_job_';
+
+  function getCurrentDate() {
+    if (currentViewDate) return currentViewDate;
+    try {
+      currentViewDate = extractCurrentDateFromPage();
+    } catch (_) { }
+    return currentViewDate || '';
+  }
+
+  function safeSetSessionItem(key, value) {
+    try {
+      if (typeof sessionStorage === 'undefined') return;
+      sessionStorage.setItem(key, value);
+    } catch (e) {
+      try {
+        const qsbKeys = [];
+        for (let i = 0; i < sessionStorage.length; i++) {
+          const k = sessionStorage.key(i);
+          if (k && (k.startsWith(WORK_CACHE_PREFIX) || k.startsWith(JOB_CACHE_PREFIX))) {
+            qsbKeys.push(k);
+          }
+        }
+        for (let i = 0; i < Math.min(20, qsbKeys.length); i++) {
+          sessionStorage.removeItem(qsbKeys[i]);
+        }
+        sessionStorage.setItem(key, value);
+      } catch (_) { }
+    }
+  }
+
+  function getCachedWorkDetails(workUuid) {
+    if (!workUuid) return null;
+    if (workCache.has(workUuid)) return workCache.get(workUuid);
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        const val = sessionStorage.getItem(WORK_CACHE_PREFIX + workUuid);
+        if (val) {
+          const parsed = JSON.parse(val);
+          workCache.set(workUuid, parsed);
+          return parsed;
+        }
+      }
+    } catch (_) { }
+    return null;
+  }
+
+  function setCachedWorkDetails(workUuid, details) {
+    if (!workUuid || !details) return;
+    workCache.set(workUuid, details);
+    safeSetSessionItem(WORK_CACHE_PREFIX + workUuid, JSON.stringify(details));
+  }
+
+  function makeJobCacheKey(date, jobUuid) {
+    return date ? `${date}:${jobUuid}` : String(jobUuid);
+  }
+
+  function getJobCache(jobUuid, date) {
+    const d = date || getCurrentDate();
+    const key = makeJobCacheKey(d, jobUuid);
+    if (errorCache.has(key)) return errorCache.get(key);
+    if (errorCache.has(jobUuid)) return errorCache.get(jobUuid);
+
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        const val = sessionStorage.getItem(JOB_CACHE_PREFIX + key);
+        if (val) {
+          const data = JSON.parse(val);
+          errorCache.set(key, data);
+          return data;
+        }
+      }
+    } catch (_) { }
+    return null;
+  }
+
+  function setJobCache(jobUuid, date, data) {
+    const d = date || getCurrentDate();
+    const key = makeJobCacheKey(d, jobUuid);
+    errorCache.set(key, data);
+    if (!data.loading) {
+      safeSetSessionItem(JOB_CACHE_PREFIX + key, JSON.stringify(data));
+    }
+  }
+
   let preloadQueue = [];
   let preloadRunning = false;
   let preloadAbort = null;              // AbortController
@@ -487,6 +576,10 @@
     bar.style.top = next + 'px';
   }
 
+  function onFilterBarResize() {
+    alignFilterBar();
+  }
+
   /** 注入当帧、字体/主题重排后各校一次；窗口尺寸变化再校一次（监听只装一遍） */
   function scheduleAlign() {
     const raf = typeof requestAnimationFrame === 'function'
@@ -497,7 +590,7 @@
     setTimeout(alignFilterBar, 1000);
     if (alignHooked) return;
     alignHooked = true;
-    window.addEventListener('resize', () => alignFilterBar(), { passive: true });
+    window.addEventListener('resize', onFilterBarResize, { passive: true });
   }
 
   function injectFilterBar() {
@@ -723,11 +816,12 @@
     XMLHttpRequest.prototype.send = function (body) {
       const hooks = hooksForUrl(this._qsbUrl);
       if (hooks.length) {
-        hooks.forEach(h => { try { h.onRequest?.(body, this._qsbUrl); } catch (_) { } });
+        const reqContext = {};
+        hooks.forEach(h => { try { h.onRequest?.(body, this._qsbUrl, reqContext); } catch (_) { } });
         this.addEventListener('load', function () {
           let data = null;
           try { data = JSON.parse(this.responseText); } catch (_) { return; }
-          hooks.forEach(h => { try { h.onResponse?.(data, this._qsbUrl); } catch (_) { } });
+          hooks.forEach(h => { try { h.onResponse?.(data, this._qsbUrl, reqContext); } catch (_) { } });
         });
       }
       return origXHRSend.call(this, body);
@@ -753,15 +847,16 @@
         } catch (_) { }
       }
 
+      const reqContext = {};
       const hooks = hooksForUrl(url);
       if (hooks.length) {
-        hooks.forEach(h => { try { h.onRequest?.(init?.body, url); } catch (_) { } });
+        hooks.forEach(h => { try { h.onRequest?.(init?.body, url, reqContext); } catch (_) { } });
       }
       const p = origFetch.apply(this, arguments);
       if (hooks.length) {
         p.then(response => {
           response.clone().json()
-            .then(data => hooks.forEach(h => { try { h.onResponse?.(data, url); } catch (_) { } }))
+            .then(data => hooks.forEach(h => { try { h.onResponse?.(data, url, reqContext); } catch (_) { } }))
             .catch(() => { });
           return response;
         });
@@ -770,39 +865,46 @@
     };
   }
 
-  function tryExtractDateFromBody(body) {
+  function tryExtractDateFromBody(body, url, reqContext) {
     try {
       if (!body) return;
       let parsed = null;
       if (typeof body === 'string') {
         parsed = JSON.parse(body);
       } else if (body instanceof FormData) {
-        lastInterceptedDateTime = body.get('dateTime');
+        const dt = body.get('dateTime');
+        if (dt) {
+          lastInterceptedDateTime = String(dt).trim();
+          if (reqContext) reqContext.dateTime = lastInterceptedDateTime;
+        }
         return;
       } else if (typeof body === 'object') {
         parsed = body;
       }
       if (parsed && parsed.dateTime) {
-        lastInterceptedDateTime = String(parsed.dateTime).trim();
+        const dt = String(parsed.dateTime).trim();
+        lastInterceptedDateTime = dt;
+        if (reqContext) reqContext.dateTime = dt;
       }
     } catch (_) { }
   }
 
-  function onListResponseReceived(data) {
+  function onListResponseReceived(data, url, reqContext) {
     if (!data || data.code !== '10000') return;
     const biz = data.bizData;
     if (!biz) return;
     const records = biz.records || [];
     if (!Array.isArray(records) || !records.length) return;
 
-    // 清理旧状态（取消正在运行的旧请求并清空缓存）
+    // 清理旧运行队列与浮层（不清除已有正确缓存）
     resetPreloadState();
 
     // 确定查询日期：
-    // 1. 优先使用拦截到的请求体中的 dateTime
-    // 2. 其次从返回记录的 lastStartTime/lastEndTime 中推断（格式如 2026-11-08 09:16:18）
-    // 3. 再次从页面 DOM 中提取
-    let dateTime = lastInterceptedDateTime;
+    // 1. 优先使用当前请求上下文中的 dateTime
+    // 2. 其次使用最近拦截到的 dateTime
+    // 3. 再次从返回记录的 lastStartTime/lastEndTime 中推断（格式如 2026-11-08 09:16:18）
+    // 4. 再次从页面 DOM 中提取
+    let dateTime = (reqContext && reqContext.dateTime) || lastInterceptedDateTime;
     if (!dateTime) {
       for (const r of records) {
         const timeStr = r.lastStartTime || r.lastEndTime;
@@ -813,22 +915,45 @@
       }
     }
     if (!dateTime) {
-      dateTime = extractCurrentDateFromPage();
+      dateTime = getCurrentDate();
     }
+    currentViewDate = dateTime;
 
     // 提取需预加载的非完成任务（rpaStatus !== 5）
     const targetJobs = records.filter(r => r.jobUuid && r.rpaStatus !== RPA_STATUS.COMPLETED);
 
-    // 加入预加载队列
+    // 加入预加载队列（若已有该日期与运行周期的有效缓存则跳过网络请求）
     for (const job of targetJobs) {
-      errorCache.set(job.jobUuid, { loading: true, text: '加载中...', details: [], counts: {} });
-      preloadQueue.push({ jobUuid: job.jobUuid, dateTime });
+      const cached = getJobCache(job.jobUuid, dateTime);
+      const isSameRun = cached && !cached.loading &&
+        (cached.lastStartTime === job.lastStartTime) &&
+        (cached.lastEndTime === job.lastEndTime);
+
+      if (isSameRun) continue;
+
+      setJobCache(job.jobUuid, dateTime, {
+        loading: true,
+        text: '加载中...',
+        details: [],
+        counts: {},
+        lastStartTime: job.lastStartTime,
+        lastEndTime: job.lastEndTime
+      });
+      preloadQueue.push({
+        jobUuid: job.jobUuid,
+        dateTime,
+        lastStartTime: job.lastStartTime,
+        lastEndTime: job.lastEndTime
+      });
     }
 
     if (preloadQueue.length) startPreloadWorker();
 
     // 等 DOM 更新后重新绑定（先清理旧行标记，防止新旧行复用遗留脏数据）
-    setTimeout(() => {
+    clearTimeout(postListBindTimer);
+    postListBindTimer = setTimeout(() => {
+      postListBindTimer = null;
+      if (!isTaskExecuteActive()) return;
       _storeColIdx = -1; // 重新探测列索引
       findStoreColumnIndex();
       if (filterInput && filterInput.value) applyFilter(filterInput.value);
@@ -853,11 +978,13 @@
     return new Date(bjMs).toISOString().slice(0, 10);
   }
 
-  function resetPreloadState() {
+  function resetPreloadState(clearCache = false) {
     if (preloadAbort) { preloadAbort.abort(); preloadAbort = null; }
     preloadQueue = [];
     preloadRunning = false;
-    errorCache.clear();
+    if (clearCache) {
+      errorCache.clear();
+    }
     hideTooltip();
   }
 
@@ -880,18 +1007,25 @@
       const task = preloadQueue.shift();
       if (!task) break;
       try {
-        await preloadJobErrors(task.jobUuid, task.dateTime, signal);
+        await preloadJobErrors(task.jobUuid, task.dateTime, signal, task.lastStartTime, task.lastEndTime);
       } catch (e) {
         if (e.name === 'AbortError') return;
         console.warn(LOG_TAG, '预加载失败:', task.jobUuid, e.message);
-        errorCache.set(task.jobUuid, { loading: false, text: '加载失败', details: [], counts: {} });
+        setJobCache(task.jobUuid, task.dateTime, {
+          loading: false,
+          text: '加载失败',
+          details: [],
+          counts: {},
+          lastStartTime: task.lastStartTime,
+          lastEndTime: task.lastEndTime
+        });
       }
       // 请求间隔
       if (preloadQueue.length > 0) await sleep(REQUEST_INTERVAL_MS);
     }
   }
 
-  async function preloadJobErrors(jobUuid, dateTime, signal) {
+  async function preloadJobErrors(jobUuid, dateTime, signal, lastStartTime, lastEndTime) {
     // ── L2: 获取执行订单 ──
     const l2Res = await apiPost('/job/record/detail/new', {
       pageNo: 1, pageSize: 50, jobUuid, dateTime
@@ -903,14 +1037,14 @@
 
     const l2Records = l2Res.bizData?.records || [];
     if (!l2Records.length) {
-      finalize(jobUuid, '无执行记录', [], {});
+      finalize(jobUuid, '无执行记录', [], {}, dateTime, lastStartTime, lastEndTime);
       return;
     }
 
     // 取最新一条订单
     const exeOrderUuid = l2Records[0]?.exeOrderUuid;
     if (!exeOrderUuid) {
-      finalize(jobUuid, '无订单ID', [], {});
+      finalize(jobUuid, '无订单ID', [], {}, dateTime, lastStartTime, lastEndTime);
       return;
     }
 
@@ -929,16 +1063,26 @@
       : [];
 
     if (!failedWorks.length) {
-      finalize(jobUuid, '无失败工作项', [], { '1xxx': 0, '2xxx': 0, '3xxx': 0, 'unknown': 0 });
+      finalize(jobUuid, '无失败工作项', [], { '1xxx': 0, '2xxx': 0, '3xxx': 0, 'unknown': 0 }, dateTime, lastStartTime, lastEndTime);
       return;
     }
 
-    // ── L4: 逐个失败工作项查流程块详情 ──
+    // ── L4: 逐个失败工作项查流程块详情（优先读取 workUuid 持久缓存） ──
     const allDetails = [];
     const counts = { '1xxx': 0, '2xxx': 0, '3xxx': 0, 'unknown': 0 };
 
     for (const work of failedWorks) {
       if (signal.aborted) return;
+
+      const cachedBlocks = getCachedWorkDetails(work.workUuid);
+      if (cachedBlocks) {
+        for (const block of cachedBlocks) {
+          counts[block.category] = (counts[block.category] || 0) + 1;
+          allDetails.push(block);
+        }
+        continue;
+      }
+
       await sleep(REQUEST_INTERVAL_MS);
 
       try {
@@ -946,6 +1090,7 @@
           workUuid: work.workUuid, isProcess: 'N', status: 0
         }, signal);
 
+        const workBlocks = [];
         if (l4Res?.code === '10000' && l4Res.bizData) {
           const blocks = l4Res.bizData.output?.result || [];
           for (const block of blocks) {
@@ -956,7 +1101,7 @@
             counts[cat]++;
             const rawMsg = String(block.errMessage || block.description || '').trim();
             const structured = parseStructuredError(rawMsg, block.blockName);
-            allDetails.push({
+            const item = {
               errCode,
               shopName: String(block.shopName || '-'),
               category: cat,
@@ -965,9 +1110,12 @@
               target: structured.target,
               runTime: structured.runTime,
               rawMsg: structured.raw
-            });
+            };
+            workBlocks.push(item);
+            allDetails.push(item);
           }
         }
+        setCachedWorkDetails(work.workUuid, workBlocks);
       } catch (e) {
         if (e.name === 'AbortError') return;
         // 单条 L4 失败不中断
@@ -975,27 +1123,35 @@
     }
 
     const text = `[1xxx: ${counts['1xxx']}个, 2xxx: ${counts['2xxx']}个, 3xxx: ${counts['3xxx']}个, unknown: ${counts['unknown']}个]`;
-    finalize(jobUuid, text, allDetails, counts);
-    updateRowVisualBar(jobUuid);
+    finalize(jobUuid, text, allDetails, counts, dateTime, lastStartTime, lastEndTime);
+    updateRowVisualBar(jobUuid, dateTime);
   }
 
-  function finalize(jobUuid, text, details, counts) {
-    errorCache.set(jobUuid, { loading: false, text, details, counts });
+  function finalize(jobUuid, text, details, counts, dateTime, lastStartTime, lastEndTime) {
+    const d = dateTime || currentViewDate;
+    setJobCache(jobUuid, d, {
+      loading: false,
+      text,
+      details,
+      counts,
+      lastStartTime,
+      lastEndTime
+    });
     // 如果当前 tooltip 正在显示此 job，仅当鼠标仍在锚点或浮层上时才就地刷新；若鼠标已移开则关闭
     if (currentTooltipJobUuid === jobUuid && currentTooltipAnchor) {
       if (hoveredStatusTd === currentTooltipAnchor || isMouseOverTooltip) {
-        showTooltip(currentTooltipAnchor, jobUuid);
+        showTooltip(currentTooltipAnchor, jobUuid, d);
       } else {
         hideTooltip();
       }
     }
-    updateRowVisualBar(jobUuid);
+    updateRowVisualBar(jobUuid, d);
   }
 
   // ═══════════════════════════════════════════════════════════════
   // 外显胶囊色条（无需 Hover 即可一眼看清错误结构）
   // ═══════════════════════════════════════════════════════════════
-  function updateRowVisualBar(jobUuid) {
+  function updateRowVisualBar(jobUuid, date) {
     const mainTable = getMainTable();
     if (!mainTable) return;
     // 优先通过 data-row-key 或已缓存的 jobUuid 快速单点定位行，避免 O(N) 扫全表
@@ -1010,7 +1166,7 @@
       }
     }
     if (targetRow) {
-      renderBarInRow(targetRow, jobUuid);
+      renderBarInRow(targetRow, jobUuid, date);
     }
   }
 
@@ -1047,9 +1203,9 @@
     if (idx >= 0) {
       const td = cells[idx];
       if (!td) return null;
-      if (td.querySelector?.('.qsb-status-bar')) return td;
       const text = td.textContent.replace(/\s+/g, '');
       if (text.includes('已完成') || text === '完成' || text === '运行完成') return null;
+      if (td.querySelector?.('.qsb-status-bar')) return td;
       return STATUS_TEXT_HINTS.some(h => text.includes(h)) ? td : null;
     }
 
@@ -1064,20 +1220,20 @@
     return null;
   }
 
-  function renderBarInRow(row, jobUuid) {
-    const cached = errorCache.get(jobUuid);
-    if (!cached) return;
+  function renderBarInRow(row, jobUuid, date) {
+    const d = date || row.getAttribute('data-date') || getCurrentDate();
+    const cached = getJobCache(jobUuid, d);
 
     const targetCell = getStatusCell(row);
     if (!targetCell) return;
 
     let barEl = targetCell.querySelector('.qsb-status-bar');
 
-    // 正在加载中，或没有报错信息的任务：不显示任何文字/胶囊，保持界面干净
-    if (cached.loading) {
+    // 未缓存、正在加载中，或没有报错信息的任务：不显示任何文字/胶囊，保持界面干净
+    if (!cached || cached.loading) {
       if (barEl) {
         isSelfModifyingDOM = true;
-        try { barEl.innerHTML = ''; } finally { setTimeout(() => { isSelfModifyingDOM = false; }, 0); }
+        try { barEl.remove(); } finally { setTimeout(() => { isSelfModifyingDOM = false; }, 0); }
       }
       return;
     }
@@ -1097,7 +1253,7 @@
     try {
       // 如果没有任何报错数量，清空色球展示，不显示“分析中...”或空标签
       if (!segHtml) {
-        if (barEl) barEl.innerHTML = '';
+        if (barEl) barEl.remove();
         return;
       }
 
@@ -1126,20 +1282,13 @@
   }
 
   function _attachTooltipListenersCore(forceRebind = false) {
+    if (!isTaskExecuteActive()) return;
     const mainTable = getMainTable();
     if (!mainTable) return;
     const rows = mainTable.querySelectorAll('.ant-table-tbody tr.ant-table-row');
-    rows.forEach(row => {
-      if (forceRebind) {
-        delete row._qsbBound;
-        delete row._qsbJobUuid;
-        // 清理行内可能残留的旧色标元素
-        const oldBar = row.querySelector('.qsb-status-bar');
-        if (oldBar) oldBar.remove();
-      }
-      if (row._qsbBound) return;
-      row._qsbBound = true;
+    const viewDate = getCurrentDate();
 
+    rows.forEach(row => {
       const jobUuid = extractJobUuid(row);
       if (!jobUuid) return;
 
@@ -1153,13 +1302,26 @@
         if (stale) stale.remove();
         cell.classList.remove('qsb-status-cell');
         cell.removeAttribute('data-job-uuid');
+        cell.removeAttribute('data-date');
       });
 
-      if (!td) return;
+      if (!td) {
+        // 完成状态或无需显示浮层的行：彻底移除可能残留的旧色条与属性标记
+        row.querySelectorAll('.qsb-status-bar').forEach(b => b.remove());
+        row.querySelectorAll('.qsb-status-cell').forEach(cell => {
+          cell.classList.remove('qsb-status-cell');
+          cell.removeAttribute('data-job-uuid');
+          cell.removeAttribute('data-date');
+        });
+        return;
+      }
+
+      row.setAttribute('data-date', viewDate);
       td.classList.add('qsb-status-cell');
       td.setAttribute('data-job-uuid', jobUuid);
+      td.setAttribute('data-date', viewDate);
       td.style.cursor = 'pointer';
-      renderBarInRow(row, jobUuid);
+      renderBarInRow(row, jobUuid, viewDate);
     });
   }
 
@@ -1179,10 +1341,15 @@
     return getStatusCell(row) === td ? td : null;
   }
 
+  function isTaskExecuteActive() {
+    return Boolean(activePage && activePage.def && activePage.def.name === 'taskExecute');
+  }
+
   let globalHoverTimer = null;
   function setupTooltipDelegation() {
     // 1. 悬停状态单元格触发展示（带防抖）
     document.addEventListener('mouseover', e => {
+      if (!isTaskExecuteActive()) return;
       const td = findStatusCell(e.target);
       if (!td) return;
 
@@ -1212,13 +1379,14 @@
       globalHoverTimer = setTimeout(() => {
         // 只要用户鼠标依然停留在该单元格上，立即展示
         if (hoveredStatusTd === td) {
-          showTooltip(td, jobUuid);
+          showTooltip(td, jobUuid, td.getAttribute('data-date') || getCurrentDate());
         }
       }, HOVER_DEBOUNCE_MS);
     });
 
     // 2. 移出状态单元格触发延时隐藏
     document.addEventListener('mouseout', e => {
+      if (!isTaskExecuteActive()) return;
       const td = findStatusCell(e.target);
       if (!td) return;
       // 如果鼠标只是移到了该单元格的内部子元素（如文字、色标等），不视为移开
@@ -1234,6 +1402,7 @@
 
     // 3. 全局 pointermove 巡检：只要鼠标不在当前 anchor 且不在当前 tooltip 内，确保激活隐藏倒计时
     document.addEventListener('pointermove', e => {
+      if (!isTaskExecuteActive()) return;
       if (!currentTooltipEl) return;
       const target = e.target;
       const inAnchor = currentTooltipAnchor && (currentTooltipAnchor === target || currentTooltipAnchor.contains(target));
@@ -1251,6 +1420,7 @@
 
     // 4. 点击外部立即关闭
     document.addEventListener('mousedown', e => {
+      if (!isTaskExecuteActive()) return;
       if (!currentTooltipEl) return;
       if (currentTooltipEl.contains(e.target) || currentTooltipAnchor?.contains(e.target)) return;
       hideTooltip();
@@ -1258,6 +1428,7 @@
 
     // 5. 页面或表格滚动时关闭（允许 tooltip 内部内容滚动）
     window.addEventListener('scroll', e => {
+      if (!isTaskExecuteActive()) return;
       if (!currentTooltipEl) return;
       if (e.target && currentTooltipEl.contains(e.target)) return;
       hideTooltip();
@@ -1265,6 +1436,7 @@
 
     // 6. 按 Esc 键关闭
     document.addEventListener('keydown', e => {
+      if (!isTaskExecuteActive()) return;
       if (e.key === 'Escape' && currentTooltipEl) {
         hideTooltip();
       }
@@ -1272,19 +1444,17 @@
 
     // 7. 窗口失焦时关闭
     window.addEventListener('blur', () => {
+      if (!isTaskExecuteActive()) return;
       hideTooltip();
     });
   }
 
   function extractJobUuid(row) {
-    if (row._qsbJobUuid) return row._qsbJobUuid;
+    if (!row) return null;
 
-    // 1. data-row-key（Ant Table 默认渲染）
+    // 1. data-row-key（Ant Table 默认渲染，最权威直接，无缓存滞后风险）
     const key = row.getAttribute('data-row-key');
-    if (key) {
-      row._qsbJobUuid = key;
-      return key;
-    }
+    if (key) return key;
 
     // 2. React Fiber
     try {
@@ -1294,14 +1464,8 @@
         let fiber = row[fiberKey];
         for (let depth = 0; fiber && depth < 20; depth++) {
           const props = fiber.memoizedProps || fiber.pendingProps;
-          if (props?.record?.jobUuid) {
-            row._qsbJobUuid = props.record.jobUuid;
-            return props.record.jobUuid;
-          }
-          if (props?.['data-row-key']) {
-            row._qsbJobUuid = props['data-row-key'];
-            return props['data-row-key'];
-          }
+          if (props?.record?.jobUuid) return props.record.jobUuid;
+          if (props?.['data-row-key']) return props['data-row-key'];
           fiber = fiber.return;
         }
       }
@@ -1313,17 +1477,14 @@
       if (vueKey) {
         const vm = row[vueKey];
         const rec = vm?.record || vm?.$props?.record || vm?.ctx?.record;
-        if (rec?.jobUuid) {
-          row._qsbJobUuid = rec.jobUuid;
-          return rec.jobUuid;
-        }
+        if (rec?.jobUuid) return rec.jobUuid;
       }
     } catch (_) { }
 
     return null;
   }
 
-  function showTooltip(anchorEl, jobUuid) {
+  function showTooltip(anchorEl, jobUuid, date) {
     if (!anchorEl || !anchorEl.isConnected) {
       hideTooltip();
       return;
@@ -1333,7 +1494,8 @@
     currentTooltipJobUuid = jobUuid;
     currentTooltipAnchor = anchorEl;
 
-    const cached = errorCache.get(jobUuid);
+    const d = date || anchorEl.getAttribute('data-date') || anchorEl.closest('.ant-table-row')?.getAttribute('data-date') || getCurrentDate();
+    const cached = getJobCache(jobUuid, d);
     if (!cached) return; // 非预加载目标（已完成），不显示
 
     const tooltip = document.createElement('div');
@@ -1434,6 +1596,8 @@
     if (currentTooltipEl) { currentTooltipEl.remove(); currentTooltipEl = null; }
     currentTooltipJobUuid = null;
     currentTooltipAnchor = null;
+    hoveredStatusTd = null;
+    hoveredStatusJobUuid = null;
     isMouseOverTooltip = false;
   }
 
@@ -1450,12 +1614,28 @@
   // 页面变化监听
   // ═══════════════════════════════════════════════════════════════
   let rearmPageObserver = null;   // SPA 重进目标页时重新接管表格观察
+  let tableObserver = null;
+  let mutationDebounce = null;
+  let currentObservedTarget = null;
+  let pageChangeListenersReady = false;
+
+  function disconnectTableObserver() {
+    if (tableObserver) {
+      tableObserver.disconnect();
+      currentObservedTarget = null;
+    }
+    clearTimeout(mutationDebounce);
+    mutationDebounce = null;
+  }
 
   function setupPageChangeListeners() {
-    let mutationDebounce = null;
-    let currentObservedTarget = null;
+    if (pageChangeListenersReady) return;
+    pageChangeListenersReady = true;
 
-    const observer = new MutationObserver(mutations => {
+    tableObserver = new MutationObserver(mutations => {
+      // 0. 当前页面必须是 taskExecute
+      if (!isTaskExecuteActive()) return;
+
       // 1. 核心防护：脚本内部正在操作 DOM 时，直接丢弃回调，杜绝自激死循环
       if (isSelfModifyingDOM) return;
 
@@ -1501,18 +1681,22 @@
       // 防抖合并：短时间内多次表格变化只处理一次
       clearTimeout(mutationDebounce);
       mutationDebounce = setTimeout(() => {
+        if (!isTaskExecuteActive()) return;
         attachTooltipListeners();
         if (filterInput?.value) applyFilter(filterInput.value);
       }, 500);
     });
 
     function ensureNarrowObserver() {
+      if (!isTaskExecuteActive()) return;
       const tableWrapper = document.querySelector('.ant-table-wrapper') || document.querySelector('.ant-table');
       const target = tableWrapper || document.body;
       if (target !== currentObservedTarget) {
-        observer.disconnect();
-        observer.observe(target, { childList: true, subtree: true });
-        currentObservedTarget = target;
+        if (tableObserver) {
+          tableObserver.disconnect();
+          tableObserver.observe(target, { childList: true, subtree: true });
+          currentObservedTarget = target;
+        }
       }
     }
 
@@ -1521,6 +1705,7 @@
 
     // 点击事件：日期切换 / 搜索 / 重置 / 分页
     document.addEventListener('click', e => {
+      if (!isTaskExecuteActive()) return;
       const t = e.target;
       if (t.closest?.('.ant-tabs-tab') || t.closest?.('.ant-radio-button-wrapper')) {
         resetPreloadState();
@@ -1854,8 +2039,6 @@
 
   function enterPage(def) {
     ensureInterceptor();
-    ensurePageHooks();
-    if (rearmPageObserver) rearmPageObserver();     // 旧容器可能已随路由销毁
 
     // 同一页面且 UI 还在（仅 query 变化、分页、keep-alive 回退），不重复激活
     if (activePage && activePage.def === def && document.querySelector('.qsb-filter-bar')) return;
@@ -1864,6 +2047,8 @@
       activePage = { def, state: { runId: 0, barInjected: false, loopRunning: false } };
       console.log(LOG_TAG, VERSION, `${def.name} 目标页面已激活`);
     }
+    ensurePageHooks();
+    if (rearmPageObserver) rearmPageObserver();     // 旧容器可能已随路由销毁
     def.setup(activePage.state);
   }
 
@@ -1959,10 +2144,33 @@
       tryInject();
     },
     teardown() {
+      // 1. 物理移除筛选栏注入的 DOM 节点，防止下次进入命中已死节点导致 filterInput 锁死为 null
+      document.querySelectorAll('.qsb-filter-form-item, .qsb-filter-bar').forEach(el => el.remove());
       filterInput = null;         // 页码/筛选框句柄随 DOM 一起失效，清空避免跨页残留
       countBadge = null;
       filterAnchorBtn = null;
-      resetPreloadState();        // 中断预加载并关闭浮层
+
+      // 2. 解除窗口 resize 监听器
+      if (alignHooked) {
+        window.removeEventListener('resize', onFilterBarResize);
+        alignHooked = false;
+      }
+
+      // 3. 断开表格 MutationObserver 并清理防抖定时器
+      disconnectTableObserver();
+
+      // 4. 清理延迟绑定与防抖定时器，杜绝离开页面后的异步 DOM 操作
+      clearTimeout(_attachDebounce);
+      _attachDebounce = null;
+      clearTimeout(postListBindTimer);
+      postListBindTimer = null;
+
+      // 5. 清理对表格 DOM 的强引用缓存
+      _statusColCache = { table: null, idx: -1 };
+      _storeColIdx = -1;
+
+      // 6. 中断当前预加载网络请求并关闭浮层（不清除已有正确缓存）
+      resetPreloadState();
     }
   });
 
