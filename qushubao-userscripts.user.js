@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.3.1
+// @version      1.4.0
 // @description  任务运行记录店铺筛选与异常外显 + 数据中心表字段导出 Excel（单表 / 连接器多 Sheet）与启用表名复制
 // @author       青藤
 // @icon         http://dep-cloud-fe-ops.ii-ai.tech/favicon.png
@@ -19,7 +19,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.3.1';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.4.0';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
   const ROUTE_POLL_MS = 1000;          // 路由变化兜底轮询间隔
@@ -518,6 +518,57 @@
         display: flex; align-items: center; justify-content: space-between;
       }
       .qsb-copy-panel-count { color: #8c8c8c; font-size: 12px; }
+
+      /* 运行记录：机器人自定义列与设置项 */
+      .qsb-bot-th,
+      .qsb-bot-cell {
+        width: 110px;
+        max-width: 110px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .qsb-field-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 5px 12px;
+        user-select: none;
+        transition: opacity 0.15s ease, background-color 0.15s ease;
+      }
+      .qsb-field-item:hover { background: #f5f5f5; }
+      .qsb-field-item.qsb-dragging { opacity: 0.45; background: #e6f7ff; }
+      .qsb-field-checkbox-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0 !important;
+        cursor: pointer;
+        flex: 1;
+        min-width: 0;
+      }
+      .qsb-field-handle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 20px;
+        height: 20px;
+        color: #999;
+        cursor: grab;
+        flex-shrink: 0;
+        touch-action: none;
+      }
+      .qsb-field-handle:hover { color: #1890ff; }
+      .qsb-field-handle:active { cursor: grabbing; }
+      .qsb-drop-indicator {
+        position: fixed;
+        height: 2px;
+        background: #1890ff;
+        pointer-events: none;
+        z-index: 100002;
+        box-shadow: 0 0 0 1px rgba(24,144,255,0.2);
+      }
     `;
     document.head.appendChild(style);
   }
@@ -896,6 +947,9 @@
     const records = biz.records || [];
     if (!Array.isArray(records) || !records.length) return;
 
+    // 同步记录当前页日记录的 jobUuid -> planId 映射（保持字符串）
+    recordDailyJobPlans(records);
+
     // 清理旧运行队列与浮层（不清除已有正确缓存）
     resetPreloadState();
 
@@ -949,12 +1003,15 @@
 
     if (preloadQueue.length) startPreloadWorker();
 
-    // 等 DOM 更新后重新绑定（先清理旧行标记，防止新旧行复用遗留脏数据）
+    // 等 DOM 更新后重新绑定（先同步机器人列，再刷新店铺与状态列索引）
     clearTimeout(postListBindTimer);
     postListBindTimer = setTimeout(() => {
       postListBindTimer = null;
       if (!isTaskExecuteActive()) return;
+      if (botColConfig.visible) ensureBotMapLoaded();
+      syncBotColumn();
       _storeColIdx = -1; // 重新探测列索引
+      _statusColCache = { table: null, idx: -1 };
       findStoreColumnIndex();
       if (filterInput && filterInput.value) applyFilter(filterInput.value);
       attachTooltipListeners(true);
@@ -1155,7 +1212,8 @@
     const mainTable = getMainTable();
     if (!mainTable) return;
     // 优先通过 data-row-key 或已缓存的 jobUuid 快速单点定位行，避免 O(N) 扫全表
-    let targetRow = mainTable.querySelector(`.ant-table-tbody tr[data-row-key="${CSS.escape ? CSS.escape(jobUuid) : jobUuid}"]`);
+    const safeKey = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(jobUuid) : jobUuid;
+    let targetRow = mainTable.querySelector(`.ant-table-tbody tr[data-row-key="${safeKey}"]`);
     if (!targetRow) {
       const rows = mainTable.querySelectorAll('.ant-table-tbody tr.ant-table-row');
       for (const row of rows) {
@@ -1640,36 +1698,47 @@
       if (isSelfModifyingDOM) return;
 
       // 2. 过滤掉脚本自身引起的 DOM 变化
+      const isBotColNode = n => n && n.nodeType === 1 && (
+        n.hasAttribute?.('data-qsb-bot-col') ||
+        n.classList?.contains('qsb-status-bar') ||
+        n.classList?.contains('qsb-tooltip') ||
+        n.classList?.contains('qsb-highlight')
+      );
       const isOwnChange = mutations.every(m => {
         const t = m.target;
-        if (t.closest?.('.qsb-tooltip, .qsb-status-bar, .qsb-filter-bar, .qsb-filter-form-item')) return true;
+        if (t.closest?.('.qsb-tooltip, .qsb-status-bar, .qsb-filter-bar, .qsb-filter-form-item, [data-qsb-bot-col]')) return true;
         if (t.classList?.contains('qsb-highlight')) return true;
         for (const n of m.addedNodes) {
-          if (n.nodeType === 1 && (
-            n.classList?.contains('qsb-status-bar') ||
-            n.classList?.contains('qsb-tooltip') ||
-            n.classList?.contains('qsb-highlight')
-          )) return true;
+          if (isBotColNode(n)) return true;
         }
         for (const n of m.removedNodes) {
-          if (n.nodeType === 1 && (
-            n.classList?.contains('qsb-status-bar') ||
-            n.classList?.contains('qsb-tooltip') ||
-            n.classList?.contains('qsb-highlight')
-          )) return true;
+          if (isBotColNode(n)) return true;
         }
         return false;
       });
       if (isOwnChange) return;
 
-      // 3. 只关心表格行的实际变化
+      // 3. 关心表格行及表头/列结构变化（列开关或拖拽调序会重绘 thead / colgroup）
       let tableChanged = false;
+      let structChanged = false;
       for (const m of mutations) {
-        if (m.target.closest?.('.ant-table-tbody') ||
-          m.target.classList?.contains('ant-table-tbody')) { tableChanged = true; break; }
+        const t = m.target;
+        if (t.closest?.('.ant-table-thead, colgroup') ||
+          t.classList?.contains('ant-table-thead') ||
+          t.tagName === 'THEAD' || t.tagName === 'COLGROUP') {
+          structChanged = true;
+          tableChanged = true;
+          break;
+        }
+        if (t.closest?.('.ant-table-tbody') ||
+          t.classList?.contains('ant-table-tbody')) { tableChanged = true; break; }
         for (const n of m.addedNodes) {
           if (n.nodeType === 1 && (n.querySelector?.('.ant-table-row') ||
-            n.classList?.contains('ant-table-row'))) { tableChanged = true; break; }
+            n.classList?.contains('ant-table-row') || n.tagName === 'TH' || n.tagName === 'COL')) {
+            if (n.tagName === 'TH' || n.tagName === 'COL') structChanged = true;
+            tableChanged = true;
+            break;
+          }
         }
         if (tableChanged) break;
       }
@@ -1678,10 +1747,16 @@
       // 尝试收敛观察范围到表格容器，停止监听全页 body
       ensureNarrowObserver();
 
+      if (structChanged) {
+        _storeColIdx = -1;
+        _statusColCache = { table: null, idx: -1 };
+      }
+
       // 防抖合并：短时间内多次表格变化只处理一次
       clearTimeout(mutationDebounce);
       mutationDebounce = setTimeout(() => {
         if (!isTaskExecuteActive()) return;
+        syncBotColumn();
         attachTooltipListeners();
         if (filterInput?.value) applyFilter(filterInput.value);
       }, 500);
@@ -2106,7 +2181,762 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  // 注册：任务运行记录页（筛选 + 报错外显）
+  // 功能 3：运行记录计划视图「机器人」自定义列
+  // ═══════════════════════════════════════════════════════════════
+  const BOT_COL_STORAGE_KEY = 'qsb_task_exec_bot_col_v1';
+  const BOT_COL_LABEL = '机器人';
+  const BOT_COL_WIDTH = 110;
+  const SCHEDULE_PAGE_SIZE = 100;
+  const DEFAULT_BOT_ANCHOR = { key: 'storeName', side: 'after', label: '店铺' };
+  const NATIVE_COL_ORDER = [
+    { key: 'jobName', labels: ['计划名称'] },
+    { key: 'storeName', labels: ['店铺', '店铺名称', '关联店铺'] },
+    { key: 'lastStartTime', labels: ['最近运行开始时间'] },
+    { key: 'lastEndTime', labels: ['最近运行结束时间'] },
+    { key: 'rpaStatus', labels: ['取数执行'] },
+    { key: 'fileCollectionStatus', labels: ['采集文件校验'] },
+    { key: 'dbStatus', labels: ['数据入库'] },
+    { key: 'inspectionStatus', labels: ['数据校验'] },
+    { key: 'operation', labels: ['操作'] }
+  ];
+
+  const planBotById = new Map();        // planId(string) -> botName
+  const planBotByJobUuid = new Map();   // jobUuid(string) -> botName
+  const jobPlanMap = new Map();         // jobUuid(string) -> planId(string)
+  const observedFieldMeta = new Map();  // data-rbd-draggable-id -> label
+  let observedFieldOrder = [];          // [{ key, label }]
+  let botColConfig = loadBotColConfig();
+  let botMapLoaded = false;
+  let botMapPromise = null;
+  let botMapAbort = null;
+  let fieldSettingObserver = null;
+  let fieldSettingSyncTimer = null;
+  let botDragState = null;
+  let botDropIndicator = null;
+
+  function cloneDefaultBotConfig() {
+    return { visible: false, anchor: { ...DEFAULT_BOT_ANCHOR } };
+  }
+
+  function loadBotColConfig() {
+    const def = cloneDefaultBotConfig();
+    try {
+      if (typeof localStorage === 'undefined') return def;
+      const raw = localStorage.getItem(BOT_COL_STORAGE_KEY);
+      if (!raw) return def;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return def;
+      const anchor = parsed.anchor;
+      const validAnchor = anchor && typeof anchor.key === 'string' && anchor.key.trim()
+        ? {
+          key: anchor.key.trim(),
+          side: anchor.side === 'before' ? 'before' : 'after',
+          label: typeof anchor.label === 'string' ? anchor.label.trim() : ''
+        }
+        : { ...DEFAULT_BOT_ANCHOR };
+      return { visible: Boolean(parsed.visible), anchor: validAnchor };
+    } catch (_) {
+      return def;
+    }
+  }
+
+  function saveBotColConfig(cfg) {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      localStorage.setItem(BOT_COL_STORAGE_KEY, JSON.stringify(cfg));
+    } catch (_) { }
+  }
+
+  function resetBotColConfig() {
+    botColConfig = cloneDefaultBotConfig();
+    saveBotColConfig(botColConfig);
+  }
+
+  function normalizeColText(s) {
+    return String(s || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function isOperationCol(key, label) {
+    return key === 'operation' || key === 'action' || normalizeColText(label) === '操作';
+  }
+
+  function recordDailyJobPlans(records) {
+    for (const r of records) {
+      if (!r || r.jobUuid == null || r.planId == null) continue;
+      const ju = String(r.jobUuid).trim();
+      const pid = String(r.planId).trim();
+      if (ju && pid) jobPlanMap.set(ju, pid);
+    }
+  }
+
+  function extractPlanIdFromRow(row) {
+    if (!row) return null;
+    try {
+      const fiberKey = Object.keys(row).find(k =>
+        k.startsWith('__reactInternalInstance') || k.startsWith('__reactFiber'));
+      if (fiberKey) {
+        let fiber = row[fiberKey];
+        for (let depth = 0; fiber && depth < 20; depth++) {
+          const props = fiber.memoizedProps || fiber.pendingProps;
+          if (props?.record?.planId != null) return String(props.record.planId).trim();
+          fiber = fiber.return;
+        }
+      }
+    } catch (_) { }
+    try {
+      const vueKey = Object.keys(row).find(k => k.startsWith('__vue'));
+      if (vueKey) {
+        const vm = row[vueKey];
+        const rec = vm?.record || vm?.$props?.record || vm?.ctx?.record;
+        if (rec?.planId != null) return String(rec.planId).trim();
+      }
+    } catch (_) { }
+    return null;
+  }
+
+  function resolveRowBotName(row) {
+    const jobUuid = extractJobUuid(row);
+    const planId = (jobUuid && jobPlanMap.get(jobUuid)) || extractPlanIdFromRow(row);
+    if (planId && planBotById.has(planId)) {
+      return planBotById.get(planId) || '-';
+    }
+    if (jobUuid && planBotByJobUuid.has(jobUuid)) {
+      return planBotByJobUuid.get(jobUuid) || '-';
+    }
+    return '-';
+  }
+
+  async function fetchAllSchedulePlans(signal) {
+    let pageNo = 1;
+    let totalPages = 1;
+    const byId = new Map();
+    const byJobUuid = new Map();
+
+    while (pageNo <= totalPages) {
+      if (signal?.aborted) return null;
+      if (pageNo > 1) {
+        await sleep(REQUEST_INTERVAL_MS);
+        if (signal?.aborted) return null;
+      }
+
+      const res = await apiPost('/schedule/page', {
+        pageSize: SCHEDULE_PAGE_SIZE,
+        pageNo,
+        jobName: '',
+        jobType: '',
+        industryProducts: ['1']
+      }, signal);
+
+      if (!res || String(res.code) !== '10000' || !res.bizData) {
+        throw new Error((res && res.msg) || 'schedule/page 请求失败');
+      }
+
+      const biz = res.bizData;
+      const records = Array.isArray(biz.records) ? biz.records : [];
+      for (const item of records) {
+        if (!item) continue;
+        const botName = item.botName == null ? '' : String(item.botName).trim();
+        if (item.id != null && String(item.id).trim() !== '') {
+          byId.set(String(item.id).trim(), botName);
+        }
+        if (item.jobUuid != null && String(item.jobUuid).trim() !== '') {
+          byJobUuid.set(String(item.jobUuid).trim(), botName);
+        }
+      }
+
+      const pagesNum = parseInt(biz.pages, 10);
+      if (Number.isFinite(pagesNum) && pagesNum >= 1) {
+        totalPages = pagesNum;
+      } else if (biz.total != null) {
+        const totalNum = parseInt(biz.total, 10);
+        if (Number.isFinite(totalNum) && totalNum >= 0) {
+          totalPages = Math.max(1, Math.ceil(totalNum / SCHEDULE_PAGE_SIZE));
+        }
+      }
+      if (!records.length) break;
+      pageNo++;
+    }
+
+    return { byId, byJobUuid };
+  }
+
+  function ensureBotMapLoaded() {
+    if (botMapLoaded) return Promise.resolve();
+    if (botMapPromise) return botMapPromise;
+
+    botMapAbort = new AbortController();
+    const signal = botMapAbort.signal;
+    botMapPromise = fetchAllSchedulePlans(signal)
+      .then(result => {
+        botMapPromise = null;
+        if (!result || signal.aborted) return;
+        planBotById.clear();
+        planBotByJobUuid.clear();
+        result.byId.forEach((v, k) => planBotById.set(k, v));
+        result.byJobUuid.forEach((v, k) => planBotByJobUuid.set(k, v));
+        botMapLoaded = true;
+        if (isTaskExecuteActive() && botColConfig.visible) {
+          syncBotColumn();
+        }
+      })
+      .catch(err => {
+        botMapPromise = null;
+        if (err?.name === 'AbortError') return;
+        console.warn(LOG_TAG, '拉取计划机器人映射失败:', err?.message || err);
+      });
+    return botMapPromise;
+  }
+
+  function isBotColNode(el) {
+    return Boolean(el && el.hasAttribute?.('data-qsb-bot-col'));
+  }
+
+  function getNativeHeaderCells(mainTable) {
+    return Array.from(mainTable.querySelectorAll('.ant-table-thead th')).filter(th => !isBotColNode(th));
+  }
+
+  function isPlanViewTable(mainTable) {
+    if (!mainTable) return false;
+    const labels = getNativeHeaderCells(mainTable).map(th => normalizeColText(th.textContent));
+    return labels.includes('计划名称') && labels.includes('操作');
+  }
+
+  function candidateLabelsForKey(key, extraLabel) {
+    const out = [];
+    const push = v => {
+      const t = normalizeColText(v);
+      if (t && !out.includes(t)) out.push(t);
+    };
+    push(observedFieldMeta.get(key));
+    push(extraLabel);
+    const def = NATIVE_COL_ORDER.find(c => c.key === key);
+    if (def) def.labels.forEach(push);
+    return out;
+  }
+
+  function findNativeThIndex(nativeThs, key, extraLabel) {
+    const candidates = candidateLabelsForKey(key, extraLabel);
+    for (const label of candidates) {
+      const idx = nativeThs.findIndex(th => normalizeColText(th.textContent) === label);
+      if (idx >= 0) return idx;
+    }
+    if (key === 'storeName') {
+      return nativeThs.findIndex(th => normalizeColText(th.textContent).includes('店铺'));
+    }
+    return -1;
+  }
+
+  function resolveBotInsertIndex(nativeThs) {
+    const opIdx = findNativeThIndex(nativeThs, 'operation', '操作');
+    const maxIdx = opIdx >= 0 ? opIdx : nativeThs.length;
+    const { anchor } = botColConfig;
+
+    const directIdx = findNativeThIndex(nativeThs, anchor.key, anchor.label);
+    if (directIdx >= 0) {
+      if (isOperationCol(anchor.key, anchor.label)) return Math.min(directIdx, maxIdx);
+      return Math.min(anchor.side === 'before' ? directIdx : directIdx + 1, maxIdx);
+    }
+
+    const orderList = observedFieldOrder.length
+      ? observedFieldOrder
+      : NATIVE_COL_ORDER.map(c => ({ key: c.key, label: c.labels[0] }));
+    const anchorLabels = candidateLabelsForKey(anchor.key, anchor.label);
+    const anchorPos = orderList.findIndex(c => c.key === anchor.key || anchorLabels.includes(normalizeColText(c.label)));
+
+    if (anchorPos >= 0) {
+      const firstStep = anchor.side === 'after' ? -1 : 1;
+      for (const step of [firstStep, -firstStep]) {
+        for (let i = anchorPos + step; i >= 0 && i < orderList.length; i += step) {
+          const item = orderList[i];
+          if (isOperationCol(item.key, item.label)) continue;
+          const visIdx = findNativeThIndex(nativeThs, item.key, item.label);
+          if (visIdx >= 0) {
+            const after = step < 0;
+            return Math.min(after ? visIdx + 1 : visIdx, maxIdx);
+          }
+        }
+      }
+    }
+
+    return maxIdx;
+  }
+
+  function stripFixClasses(className) {
+    return String(className || '').replace(/\bant-table-cell-fix-\S+/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  function syncTableWidth(tableEl, show) {
+    if (!tableEl || !tableEl.style) return;
+    const rawW = String(tableEl.style.width || '').trim();
+    if (!/^\d+(?:\.\d+)?px$/i.test(rawW)) return;
+    const w = parseFloat(rawW);
+    const lastW = tableEl.dataset?.qsbBotLastWidth ? parseFloat(tableEl.dataset.qsbBotLastWidth) : NaN;
+
+    if (show) {
+      if (lastW !== w) {
+        const next = w + BOT_COL_WIDTH;
+        tableEl.style.width = `${next}px`;
+        if (tableEl.dataset) tableEl.dataset.qsbBotLastWidth = String(next);
+      }
+    } else {
+      if (Number.isFinite(lastW) && Math.abs(w - lastW) < 1 && w > BOT_COL_WIDTH) {
+        tableEl.style.width = `${w - BOT_COL_WIDTH}px`;
+      }
+      if (tableEl.dataset) delete tableEl.dataset.qsbBotLastWidth;
+    }
+  }
+
+  function ensureBotSlotAt(container, targetIdx, createNode) {
+    if (!container) return { node: null, changed: false };
+    const existingAtTarget = container.children?.[targetIdx];
+    if (isBotColNode(existingAtTarget)) {
+      return { node: existingAtTarget, changed: false };
+    }
+    Array.from(container.children || []).filter(isBotColNode).forEach(el => el.remove());
+    const node = createNode();
+    const ref = container.children?.[targetIdx] || null;
+    if (container.insertBefore) {
+      container.insertBefore(node, ref);
+    } else {
+      container.appendChild(node);
+    }
+    return { node, changed: true };
+  }
+
+  function removeBotColumn(mainTable) {
+    if (!mainTable) return false;
+    const nodes = mainTable.querySelectorAll('[data-qsb-bot-col]');
+    const tableEl = mainTable.querySelector('table');
+    const hasWidthTag = Boolean(tableEl?.dataset?.qsbBotLastWidth);
+    if (!nodes.length && !hasWidthTag) return false;
+
+    isSelfModifyingDOM = true;
+    try {
+      nodes.forEach(el => el.remove());
+      syncTableWidth(tableEl, false);
+    } finally {
+      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
+    }
+    _storeColIdx = -1;
+    _statusColCache = { table: null, idx: -1 };
+    return true;
+  }
+
+  function syncBotColumn() {
+    if (!isTaskExecuteActive()) return;
+    const mainTable = getMainTable();
+    if (!mainTable) return;
+
+    if (!botColConfig.visible || !isPlanViewTable(mainTable)) {
+      if (removeBotColumn(mainTable)) {
+        findStoreColumnIndex();
+        if (filterInput?.value) applyFilter(filterInput.value);
+        attachTooltipListeners(true);
+      }
+      return;
+    }
+
+    const nativeThs = getNativeHeaderCells(mainTable);
+    const targetIdx = resolveBotInsertIndex(nativeThs);
+    const sampleTh = nativeThs.find(th => !isOperationCol('', th.textContent)) || nativeThs[0];
+    const baseCellClass = stripFixClasses(sampleTh?.className) || 'ant-table-cell';
+
+    let structChanged = false;
+    isSelfModifyingDOM = true;
+    try {
+      const colgroup = mainTable.querySelector('colgroup');
+      if (colgroup) {
+        ensureBotSlotAt(colgroup, targetIdx, () => {
+          const col = document.createElement('col');
+          col.setAttribute('data-qsb-bot-col', '1');
+          col.style.width = `${BOT_COL_WIDTH}px`;
+          col.style.minWidth = `${BOT_COL_WIDTH}px`;
+          return col;
+        });
+      }
+
+      const theadTr = mainTable.querySelector('.ant-table-thead tr') || mainTable.querySelector('thead tr');
+      if (theadTr) {
+        const res = ensureBotSlotAt(theadTr, targetIdx, () => {
+          const th = document.createElement('th');
+          th.className = `${baseCellClass} qsb-bot-th`;
+          th.setAttribute('data-qsb-bot-col', '1');
+          th.textContent = BOT_COL_LABEL;
+          th.title = '当前绑定机器人';
+          return th;
+        });
+        if (res.changed) structChanged = true;
+      }
+
+      const measureRow = mainTable.querySelector('.ant-table-measure-row');
+      if (measureRow) {
+        ensureBotSlotAt(measureRow, targetIdx, () => {
+          const td = document.createElement('td');
+          td.setAttribute('data-qsb-bot-col', '1');
+          td.style.padding = '0';
+          td.style.border = '0';
+          td.style.height = '0';
+          return td;
+        });
+      }
+
+      const rows = mainTable.querySelectorAll('.ant-table-tbody tr.ant-table-row');
+      rows.forEach(row => {
+        const { node: cell, changed } = ensureBotSlotAt(row, targetIdx, () => {
+          const td = document.createElement('td');
+          td.className = `${baseCellClass} qsb-bot-cell`;
+          td.setAttribute('data-qsb-bot-col', '1');
+          return td;
+        });
+        if (changed) structChanged = true;
+        if (!cell) return;
+        const botName = resolveRowBotName(row);
+        if (cell.textContent !== botName) cell.textContent = botName;
+        const nextTitle = botName === '-' ? '' : botName;
+        if (cell.title !== nextTitle) cell.title = nextTitle;
+      });
+
+      syncTableWidth(mainTable.querySelector('table'), true);
+    } finally {
+      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
+    }
+
+    if (structChanged) {
+      _storeColIdx = -1;
+      _statusColCache = { table: null, idx: -1 };
+      findStoreColumnIndex();
+      if (filterInput?.value) applyFilter(filterInput.value);
+      attachTooltipListeners(true);
+    }
+  }
+
+  // ── 自定义字段弹窗融合与指针拖拽 ─────────────────────────────
+  function findFieldSettingPanel() {
+    return document.querySelector('.task-execute-field-setting');
+  }
+
+  function collectNativeFieldItems(panel) {
+    const items = Array.from(panel.querySelectorAll('[data-rbd-draggable-id]'));
+    observedFieldOrder = [];
+    for (const el of items) {
+      const key = String(el.getAttribute('data-rbd-draggable-id') || '').trim();
+      const label = normalizeColText(el.textContent);
+      if (!key) continue;
+      if (label) observedFieldMeta.set(key, label);
+      observedFieldOrder.push({ key, label });
+    }
+    return items;
+  }
+
+  function resolvePanelAnchorTarget(nativeItems) {
+    const opIdx = nativeItems.findIndex(el =>
+      isOperationCol(el.getAttribute('data-rbd-draggable-id'), el.textContent));
+    const maxNonOpIdx = opIdx >= 0 ? opIdx : nativeItems.length;
+    const { anchor } = botColConfig;
+
+    const findByItem = item => {
+      const key = String(item.getAttribute('data-rbd-draggable-id') || '').trim();
+      const label = normalizeColText(item.textContent);
+      const candidates = candidateLabelsForKey(anchor.key, anchor.label);
+      return key === anchor.key || (label && candidates.includes(label));
+    };
+
+    const directIdx = nativeItems.findIndex(findByItem);
+    if (directIdx >= 0) {
+      const el = nativeItems[directIdx];
+      if (isOperationCol(el.getAttribute('data-rbd-draggable-id'), el.textContent)) {
+        return { refEl: el, side: 'before' };
+      }
+      return { refEl: el, side: anchor.side };
+    }
+
+    if (opIdx >= 0) return { refEl: nativeItems[opIdx], side: 'before' };
+    if (maxNonOpIdx > 0) return { refEl: nativeItems[maxNonOpIdx - 1], side: 'after' };
+    return null;
+  }
+
+  function insertRelative(parent, node, refEl, side) {
+    if (!parent || !node || !refEl) return;
+    const children = Array.from(parent.children || []);
+    const refIdx = children.indexOf(refEl);
+    if (refIdx < 0) {
+      parent.appendChild(node);
+      return;
+    }
+    const nextRef = side === 'before' ? refEl : (children[refIdx + 1] || null);
+    if (parent.insertBefore) {
+      parent.insertBefore(node, nextRef);
+    } else if (refEl.insertAdjacentElement) {
+      refEl.insertAdjacentElement(side === 'before' ? 'beforebegin' : 'afterend', node);
+    }
+  }
+
+  function updateFieldCheckboxVisual(item, checked) {
+    const input = item.querySelector('input[type="checkbox"]');
+    const box = item.querySelector('.ant-checkbox');
+    const label = item.querySelector('.ant-checkbox-wrapper');
+    if (input) input.checked = Boolean(checked);
+    if (box) box.classList[checked ? 'add' : 'remove']('ant-checkbox-checked');
+    if (label) label.classList[checked ? 'add' : 'remove']('ant-checkbox-wrapper-checked');
+  }
+
+  function removeDropIndicator() {
+    if (botDropIndicator) {
+      botDropIndicator.remove();
+      botDropIndicator = null;
+    }
+  }
+
+  function updateDropIndicator(refEl, side) {
+    if (!refEl || typeof refEl.getBoundingClientRect !== 'function') return;
+    const rect = refEl.getBoundingClientRect();
+    if (!botDropIndicator) {
+      botDropIndicator = document.createElement('div');
+      botDropIndicator.className = 'qsb-drop-indicator';
+      document.body.appendChild(botDropIndicator);
+    }
+    const y = side === 'before' ? rect.top : rect.bottom;
+    botDropIndicator.style.left = `${rect.left}px`;
+    botDropIndicator.style.width = `${rect.width}px`;
+    botDropIndicator.style.top = `${Math.round(y - 1)}px`;
+  }
+
+  function computeDropTarget(listEl, clientY) {
+    const nativeItems = Array.from(listEl.querySelectorAll('[data-rbd-draggable-id]'));
+    if (!nativeItems.length) return null;
+
+    const opIdx = nativeItems.findIndex(el =>
+      isOperationCol(el.getAttribute('data-rbd-draggable-id'), el.textContent));
+
+    let chosen = null;
+    for (let i = 0; i < nativeItems.length; i++) {
+      const el = nativeItems[i];
+      if (typeof el.getBoundingClientRect !== 'function') continue;
+      const rect = el.getBoundingClientRect();
+      const midY = rect.top + rect.height / 2;
+      if (clientY < midY) {
+        chosen = { refEl: el, side: 'before', idx: i };
+        break;
+      }
+    }
+
+    if (!chosen) {
+      const lastIdx = nativeItems.length - 1;
+      chosen = { refEl: nativeItems[lastIdx], side: 'after', idx: lastIdx };
+    }
+
+    // 不可越过固定在最末的「操作」列
+    if (opIdx >= 0 && (chosen.idx > opIdx || (chosen.idx === opIdx && chosen.side === 'after'))) {
+      chosen = { refEl: nativeItems[opIdx], side: 'before', idx: opIdx };
+    }
+
+    const key = String(chosen.refEl.getAttribute('data-rbd-draggable-id') || '').trim();
+    const label = normalizeColText(chosen.refEl.textContent);
+    return { refEl: chosen.refEl, side: chosen.side, key, label };
+  }
+
+  function cleanupBotDrag() {
+    if (!botDragState) return;
+    document.removeEventListener('pointermove', onBotFieldPointerMove, true);
+    document.removeEventListener('pointerup', onBotFieldPointerUp, true);
+    document.removeEventListener('pointercancel', onBotFieldPointerUp, true);
+    botDragState.itemEl?.classList?.remove('qsb-dragging');
+    botDragState = null;
+    removeDropIndicator();
+  }
+
+  function onBotFieldPointerMove(e) {
+    if (!botDragState || !isTaskExecuteActive()) {
+      cleanupBotDrag();
+      return;
+    }
+    const target = computeDropTarget(botDragState.listEl, e.clientY);
+    if (!target) return;
+    botDragState.dropTarget = target;
+    updateDropIndicator(target.refEl, target.side);
+  }
+
+  function onBotFieldPointerUp(e) {
+    if (!botDragState) return;
+    const state = botDragState;
+    let drop = state.dropTarget;
+    if (e.type === 'pointerup' && typeof e.clientY === 'number') {
+      drop = computeDropTarget(state.listEl, e.clientY) || drop;
+    }
+    cleanupBotDrag();
+
+    if (e.type !== 'pointerup' || !drop || !drop.key) return;
+    botColConfig.anchor = { key: drop.key, side: drop.side, label: drop.label };
+    saveBotColConfig(botColConfig);
+
+    isSelfModifyingDOM = true;
+    try {
+      insertRelative(state.listEl, state.itemEl, drop.refEl, drop.side);
+    } finally {
+      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
+    }
+    syncBotColumn();
+  }
+
+  function startBotFieldDrag(e, itemEl, listEl) {
+    if (!isTaskExecuteActive()) return;
+    if (e.button != null && e.button !== 0) return;
+    e.preventDefault?.();
+    e.stopPropagation?.();
+    cleanupBotDrag();
+
+    botDragState = { itemEl, listEl, dropTarget: null };
+    itemEl.classList.add('qsb-dragging');
+    try { e.currentTarget?.setPointerCapture?.(e.pointerId); } catch (_) { }
+    document.addEventListener('pointermove', onBotFieldPointerMove, true);
+    document.addEventListener('pointerup', onBotFieldPointerUp, true);
+    document.addEventListener('pointercancel', onBotFieldPointerUp, true);
+  }
+
+  function createBotFieldItem() {
+    const item = document.createElement('div');
+    item.className = 'qsb-field-item';
+    item.setAttribute('data-qsb-bot-field', '1');
+
+    const label = document.createElement('label');
+    label.className = 'ant-checkbox-wrapper qsb-field-checkbox-label';
+
+    const checkboxWrap = document.createElement('span');
+    checkboxWrap.className = 'ant-checkbox';
+
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.className = 'ant-checkbox-input';
+
+    const inner = document.createElement('span');
+    inner.className = 'ant-checkbox-inner';
+
+    checkboxWrap.appendChild(input);
+    checkboxWrap.appendChild(inner);
+
+    const textSpan = document.createElement('span');
+    textSpan.textContent = BOT_COL_LABEL;
+
+    label.appendChild(checkboxWrap);
+    label.appendChild(textSpan);
+
+    const handle = document.createElement('span');
+    handle.className = 'qsb-field-handle';
+    handle.title = '拖动调整列顺序';
+    handle.innerHTML = '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">'
+      + '<circle cx="5" cy="3" r="1.3"/><circle cx="11" cy="3" r="1.3"/>'
+      + '<circle cx="5" cy="8" r="1.3"/><circle cx="11" cy="8" r="1.3"/>'
+      + '<circle cx="5" cy="13" r="1.3"/><circle cx="11" cy="13" r="1.3"/></svg>';
+
+    item.appendChild(label);
+    item.appendChild(handle);
+
+    input.addEventListener('change', () => {
+      if (!isTaskExecuteActive()) return;
+      botColConfig.visible = Boolean(input.checked);
+      saveBotColConfig(botColConfig);
+      updateFieldCheckboxVisual(item, botColConfig.visible);
+      if (botColConfig.visible) ensureBotMapLoaded();
+      syncBotColumn();
+    });
+
+    handle.addEventListener('pointerdown', e => {
+      const listEl = item.parentElement;
+      if (listEl) startBotFieldDrag(e, item, listEl);
+    });
+
+    updateFieldCheckboxVisual(item, botColConfig.visible);
+    return item;
+  }
+
+  function syncFieldSettingPanel() {
+    if (!isTaskExecuteActive()) return;
+    const panel = findFieldSettingPanel();
+    if (!panel) return;
+
+    if (!panel.dataset?.qsbResetHooked) {
+      if (panel.dataset) panel.dataset.qsbResetHooked = '1';
+      panel.addEventListener('click', e => {
+        if (!isTaskExecuteActive()) return;
+        const btn = e.target?.closest?.('button, a, [role="button"], span');
+        if (!btn) return;
+        if (normalizeColText(btn.textContent).replace(/\s+/g, '') !== '恢复默认') return;
+        resetBotColConfig();
+        syncBotColumn();
+        setTimeout(() => {
+          if (!isTaskExecuteActive()) return;
+          syncFieldSettingPanel();
+          syncBotColumn();
+        }, 0);
+      });
+    }
+
+    const nativeItems = collectNativeFieldItems(panel);
+    if (!nativeItems.length) return;
+    const listEl = nativeItems[0].parentElement;
+    if (!listEl) return;
+
+    const target = resolvePanelAnchorTarget(nativeItems);
+    if (!target) return;
+
+    let item = listEl.querySelector('.qsb-field-item[data-qsb-bot-field]');
+    const children = Array.from(listEl.children || []);
+    const curIdx = item ? children.indexOf(item) : -1;
+    const refIdx = children.indexOf(target.refEl);
+    const inRightSlot = item && curIdx >= 0 && (target.side === 'before' ? curIdx === refIdx - 1 : curIdx === refIdx + 1);
+
+    isSelfModifyingDOM = true;
+    try {
+      if (!item) item = createBotFieldItem();
+      if (!inRightSlot) {
+        insertRelative(listEl, item, target.refEl, target.side);
+      }
+      updateFieldCheckboxVisual(item, botColConfig.visible);
+    } finally {
+      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
+    }
+  }
+
+  function removeFieldSettingInjected() {
+    document.querySelectorAll('.qsb-field-item[data-qsb-bot-field]').forEach(el => el.remove());
+  }
+
+  function ensureFieldSettingObserver() {
+    if (fieldSettingObserver) return;
+    const isFieldSettingMutation = m => {
+      if (m.target?.closest?.('.task-execute-field-setting')) return true;
+      for (const n of m.addedNodes || []) {
+        if (n.nodeType === 1 && (n.classList?.contains('task-execute-field-setting') || n.querySelector?.('.task-execute-field-setting'))) {
+          return true;
+        }
+      }
+      return false;
+    };
+    fieldSettingObserver = new MutationObserver(mutations => {
+      if (!isTaskExecuteActive() || isSelfModifyingDOM) return;
+      if (!mutations.some(isFieldSettingMutation)) return;
+      clearTimeout(fieldSettingSyncTimer);
+      fieldSettingSyncTimer = setTimeout(() => {
+        fieldSettingSyncTimer = null;
+        if (!isTaskExecuteActive()) return;
+        syncFieldSettingPanel();
+        syncBotColumn();
+      }, 0);
+    });
+    fieldSettingObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function disconnectFieldSettingObserver() {
+    if (fieldSettingObserver) {
+      fieldSettingObserver.disconnect();
+      fieldSettingObserver = null;
+    }
+    clearTimeout(fieldSettingSyncTimer);
+    fieldSettingSyncTimer = null;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // 注册：任务运行记录页（筛选 + 报错外显 + 机器人列）
   // ═══════════════════════════════════════════════════════════════
   onResponse('/job/record/new', {
     onRequest: tryExtractDateFromBody,      // 从请求体取 dateTime
@@ -2123,6 +2953,11 @@
         if (runId === state.runId) state.loopRunning = false;
       };
 
+      ensureFieldSettingObserver();
+      syncFieldSettingPanel();
+      if (botColConfig.visible) ensureBotMapLoaded();
+      syncBotColumn();
+
       let retries = 0;
       const tryInject = () => {
         if (runId !== state.runId || !TASK_EXECUTE_ROUTE.test(location.pathname)) { finish(); return; }
@@ -2135,7 +2970,11 @@
           state.barInjected = true;
           console.log(LOG_TAG, '筛选栏已注入');
           finish();
-          setTimeout(attachTooltipListeners, 1000);
+          setTimeout(() => {
+            if (!isTaskExecuteActive()) return;
+            syncBotColumn();
+            attachTooltipListeners();
+          }, 1000);
         } else {
           retries++;
           setTimeout(tryInject, INJECT_RETRY_MS);
@@ -2156,8 +2995,12 @@
         alignHooked = false;
       }
 
-      // 3. 断开表格 MutationObserver 并清理防抖定时器
+      // 3. 断开表格与自定义字段面板 MutationObserver 并清理防抖定时器
       disconnectTableObserver();
+      disconnectFieldSettingObserver();
+      cleanupBotDrag();
+      removeFieldSettingInjected();
+      removeBotColumn(getMainTable());
 
       // 4. 清理延迟绑定与防抖定时器，杜绝离开页面后的异步 DOM 操作
       clearTimeout(_attachDebounce);
@@ -2165,9 +3008,17 @@
       clearTimeout(postListBindTimer);
       postListBindTimer = null;
 
-      // 5. 清理对表格 DOM 的强引用缓存
+      // 5. 清理对表格 DOM 与计划机器人映射的强引用缓存
       _statusColCache = { table: null, idx: -1 };
       _storeColIdx = -1;
+      if (botMapAbort) { botMapAbort.abort(); botMapAbort = null; }
+      botMapPromise = null;
+      botMapLoaded = false;
+      planBotById.clear();
+      planBotByJobUuid.clear();
+      jobPlanMap.clear();
+      observedFieldMeta.clear();
+      observedFieldOrder = [];
 
       // 6. 中断当前预加载网络请求并关闭浮层（不清除已有正确缓存）
       resetPreloadState();
