@@ -58,6 +58,11 @@
   - *注意：Windows 下禁止直接传目录 `node --test tests/`。*
 - **内核变更要求**：修改请求拦截、路由激活、状态分发等核心逻辑时，必须同步补齐测试用例，并执行变异验证（故意破坏逻辑确认测试变红）。
 
+### 实机调试（Chrome DevTools MCP）
+- **直连用户 Chrome，禁用 `browser` 子代理**：当用户说“调试”“去页面看下”或需排查 `dep.ai-indeed.com` 线上页面时，必须直接使用 `chrome-devtools-plugin_chrome-devtools` MCP 工具（`list_pages` → `select_page` → `evaluate_script` / `take_snapshot`）连接用户正在运行的 Chrome（已配 `--autoConnect`）；**禁止**派发内置 `browser` 子代理（无取数宝登录态与 Tampermonkey）。
+- **本地改动热注入与页面复原**：在 Tampermonkey 未更新前实机验证本地 `qushubao-userscripts.user.js` 改动时，先清理当前页面既有状态再通过 `evaluate_script` 注入最新脚本测试，验证结束后恢复被修改的界面状态（如开关、列配置、弹窗）。
+- **首次授权等待与故障排查**：每次新会话首次连入 Chrome 会弹出“允许远程调试”确认框，需提示并等待用户点击「允许」；若连接失败或 `DevToolsActivePort` 指向旧端口，提示用户确认 `chrome://inspect/#remote-debugging` 已开启，必要时检查并同步 `C:\Users\77354\AppData\Local\Google\Chrome\User Data\DevToolsActivePort`。
+
 ### 环境与网络规避
 - Windows 环境下使用 `git` 访问 GitHub 必须带参数：`-c http.sslBackend=openssl`。
 - 脚本更新源固定为：`https://ivy-reverie-vine.github.io/qushubao-userscripts/qushubao-userscripts.user.js`，禁止擅自修改。
