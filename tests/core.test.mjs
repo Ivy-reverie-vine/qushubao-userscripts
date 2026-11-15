@@ -880,6 +880,9 @@ function createRichDom() {
         }
         return null;
       },
+      matches(sel) {
+        return matchesSelector(el, sel);
+      },
       querySelectorAll(sel) {
         const out = [];
         const walk = node => {
@@ -1479,4 +1482,123 @@ test('机器人列：非计划视图不注入，离开页面 teardown 彻底清�
   assert.equal(doc.querySelector('.qsb-drop-indicator'), null, 'teardown 应清除拖拽指示线');
   assert.equal((env.docListeners.pointermove || []).length, beforeMoveCount, 'teardown 应解除拖拽监听');
   assert.equal(env.observerInstances.filter(o => o.connected).length, 0, 'teardown 应断开全部 MutationObserver');
+});
+
+test('机器人列（真实页面结构）：识别 data-rbd-droppable-id 弹窗、selection 列保护、最后运行开始时间对齐及兄弟 header 恢复默认', async () => {
+  const doc = createRichDom();
+  buildFormInDoc(doc);
+
+  // 真实表格包含第 0 列多选框列（ant-table-selection-column）及「最近运行开始时间」表头
+  const tbl = buildPlanTableInDoc(doc, {
+    headers: ['', '计划名称', '店铺', '最近运行开始时间', '最近运行结束时间', '取数执行', '数据入库', '数据校验', '操作'],
+    rows: [{ key: '1900000000000000011', cells: ['', '计划1', '店铺1', '10:00', '10:05', '已完成', '已完成', '已完成', '详情'] }],
+    width: '1216px',
+  });
+  tbl.headTr.children[0].className = 'ant-table-cell ant-table-selection-column';
+
+  const env = createEnv({
+    pathname: TARGET,
+    customDocument: doc,
+    onFetch: url => url.includes('/schedule/page')
+      ? { code: '10000', bizData: { pages: '1', records: [{ id: 'p1', jobUuid: '1900000000000000011', botName: '飞龙008' }] } }
+      : null,
+  });
+  env.documentBody = doc.body;
+  env.boot();
+  await env.flushAsync();
+
+  // 构造真实页面 Antd Popover 结构：起初带 ant-popover-hidden，header 与 droppable list 为兄弟节点
+  const popover = doc.createElement('div');
+  popover.className = 'ant-popover popover___p5B9I ant-popover-placement-bottomRight ant-popover-hidden';
+  const innerContent = doc.createElement('div');
+  innerContent.className = 'ant-popover-inner-content';
+  const contentWrap = doc.createElement('div');
+  contentWrap.className = 'content___fPC8N';
+
+  const header = doc.createElement('div');
+  header.className = 'header___UWFdL';
+  const titleSpan = doc.createElement('span');
+  titleSpan.className = 'title___Lo3KG';
+  titleSpan.textContent = '自定义字段';
+  const resetLink = doc.createElement('a');
+  resetLink.className = 'reset___EXt5g';
+  resetLink.textContent = '恢复默认';
+  header.appendChild(titleSpan);
+  header.appendChild(resetLink);
+
+  const list = doc.createElement('div');
+  list.className = 'list___RjHZx';
+  list.setAttribute('data-rbd-droppable-id', 'task-execute-field-setting');
+  const nativeFields = [
+    { key: 'planName', label: '计划名称' },
+    { key: 'storeName', label: '店铺' },
+    { key: 'startTime', label: '最后运行开始时间' },
+    { key: 'endTime', label: '最近运行结束时间' },
+    { key: 'rpaStatus', label: '取数执行' },
+    { key: 'fileCollectionStatus', label: '采集文件校验' },
+    { key: 'dbStatus', label: '数据入库' },
+    { key: 'inspectionStatus', label: '数据校验' },
+  ];
+  nativeFields.forEach((it, idx) => {
+    const row = doc.createElement('div');
+    row.className = 'item___onDki';
+    row.setAttribute('data-rbd-draggable-id', it.key);
+    const labelEl = doc.createElement('span');
+    labelEl.className = 'label___bDYeU';
+    labelEl.textContent = it.label;
+    row.appendChild(labelEl);
+    const top = 100 + idx * 40;
+    row.getBoundingClientRect = () => ({ top, left: 900, width: 220, height: 40, bottom: top + 40 });
+    list.appendChild(row);
+  });
+
+  contentWrap.appendChild(header);
+  contentWrap.appendChild(list);
+  innerContent.appendChild(contentWrap);
+  popover.appendChild(innerContent);
+  doc.body.appendChild(popover);
+
+  const bodyObs = env.observerInstances.find(o => o.connected && o.target === env.documentBody);
+  assert.ok(bodyObs, '应已挂载 body MutationObserver');
+  // 模拟先挂载、后移除 hidden class 展开弹窗
+  popover.classList.remove('ant-popover-hidden');
+  bodyObs.cb([{ type: 'attributes', attributeName: 'class', target: popover, addedNodes: [], removedNodes: [] }]);
+  await env.flushAsync();
+
+  const botItem = list.querySelector('.qsb-field-item[data-qsb-bot-field]');
+  assert.ok(botItem, '真实弹窗结构中必须注入机器人配置项');
+  assert.equal(list.children[list.children.indexOf(botItem) - 1].getAttribute('data-rbd-draggable-id'), 'storeName', '默认位置紧跟店铺之后');
+
+  // 勾选启用机器人列，应排到店铺后（index 3，在 selection[0]、计划名称[1]、店铺[2]之后）
+  const checkbox = botItem.querySelector('input[type="checkbox"]');
+  checkbox.checked = true;
+  checkbox.dispatchEvent({ type: 'change' });
+  await env.flushAsync();
+
+  assert.equal(tbl.headTr.children[3].textContent, '机器人');
+  assert.equal(tbl.tbody.querySelectorAll('tr.ant-table-row')[0].children[3].textContent, '飞龙008');
+
+  // 拖到「计划名称」最前：不得越过第 0 列多选框列，必须落在 index 1
+  const handle = botItem.querySelector('.qsb-field-handle');
+  handle.dispatchEvent({ type: 'pointerdown', button: 0, pointerId: 3 });
+  doc.dispatchDocEvent({ type: 'pointermove', clientY: 105, pointerId: 3 });
+  doc.dispatchDocEvent({ type: 'pointerup', clientY: 105, pointerId: 3 });
+  await env.flushAsync();
+  assert.equal(tbl.headTr.children[0].classList.contains('ant-table-selection-column'), true, '多选框列必须始终在第 0 列');
+  assert.equal(tbl.headTr.children[1].textContent, '机器人', '拖到计划名称前应落在 index 1');
+
+  // 拖到「最后运行开始时间」之后（弹窗文案「最后运行开始时间」≠ 表头「最近运行开始时间」）
+  handle.dispatchEvent({ type: 'pointerdown', button: 0, pointerId: 4 });
+  doc.dispatchDocEvent({ type: 'pointermove', clientY: 210, pointerId: 4 }); // startTime top: 180..220 -> mid: 200 -> after
+  doc.dispatchDocEvent({ type: 'pointerup', clientY: 210, pointerId: 4 });
+  await env.flushAsync();
+  assert.equal(tbl.headTr.children[4].textContent, '机器人', 'startTime 应精准映射到「最近运行开始时间」列之后');
+
+  // 点击兄弟 header 中的「恢复默认」<a> 标签：重置显隐与位置
+  resetLink.dispatchEvent({ type: 'click', target: resetLink });
+  await env.flushAsync();
+  const saved = JSON.parse(env.localStore.qsb_task_exec_bot_col_v1);
+  assert.equal(saved.visible, false);
+  assert.equal(saved.anchor.key, 'storeName');
+  assert.equal(tbl.table.querySelectorAll('[data-qsb-bot-col]').length, 0);
 });

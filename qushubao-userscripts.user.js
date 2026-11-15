@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.4.0
-// @description  任务运行记录店铺筛选与异常外显 + 数据中心表字段导出 Excel（单表 / 连接器多 Sheet）与启用表名复制
+// @version      1.4.1
+// @description  任务运行记录店铺筛选、异常外显与「机器人」自定义列 + 数据中心表字段导出 Excel（单表 / 连接器多 Sheet）与启用表名复制
 // @author       青藤
 // @icon         http://dep-cloud-fe-ops.ii-ai.tech/favicon.png
 // @match        https://dep.ai-indeed.com/*
@@ -19,7 +19,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.4.0';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.4.1';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
   const ROUTE_POLL_MS = 1000;          // 路由变化兜底轮询间隔
@@ -531,9 +531,11 @@
       .qsb-field-item {
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        padding: 5px 12px;
+        height: 40px;
+        padding: 6px 8px;
+        border-radius: 8px;
+        font-size: 14px;
+        box-sizing: border-box;
         user-select: none;
         transition: opacity 0.15s ease, background-color 0.15s ease;
       }
@@ -542,11 +544,19 @@
       .qsb-field-checkbox-label {
         display: inline-flex;
         align-items: center;
-        gap: 8px;
         margin: 0 !important;
         cursor: pointer;
-        flex: 1;
+        flex-shrink: 0;
+      }
+      .qsb-field-label {
+        flex: 1 1 0%;
         min-width: 0;
+        margin-left: 8px;
+        color: #3d2c29;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        cursor: pointer;
       }
       .qsb-field-handle {
         display: inline-flex;
@@ -554,7 +564,8 @@
         justify-content: center;
         width: 20px;
         height: 20px;
-        color: #999;
+        color: #bfbfbf;
+        font-size: 14px;
         cursor: grab;
         flex-shrink: 0;
         touch-action: none;
@@ -2188,17 +2199,25 @@
   const BOT_COL_WIDTH = 110;
   const SCHEDULE_PAGE_SIZE = 100;
   const DEFAULT_BOT_ANCHOR = { key: 'storeName', side: 'after', label: '店铺' };
+  // 线上 taskExecuteManagementV2 真实 data-rbd-draggable-id 键名：
+  // planName / storeName / startTime（弹窗文案「最后运行开始时间」，表头「最近运行开始时间」）/
+  // endTime / rpaStatus / fileCollectionStatus / dbStatus / inspectionStatus；
+  // aliases 保留历史键名（jobName / lastStartTime / lastEndTime / action）以兼容已有持久化配置。
   const NATIVE_COL_ORDER = [
-    { key: 'jobName', labels: ['计划名称'] },
+    { key: 'planName', labels: ['计划名称'], aliases: ['jobName'] },
     { key: 'storeName', labels: ['店铺', '店铺名称', '关联店铺'] },
-    { key: 'lastStartTime', labels: ['最近运行开始时间'] },
-    { key: 'lastEndTime', labels: ['最近运行结束时间'] },
+    { key: 'startTime', labels: ['最近运行开始时间', '最后运行开始时间'], aliases: ['lastStartTime'] },
+    { key: 'endTime', labels: ['最近运行结束时间'], aliases: ['lastEndTime'] },
     { key: 'rpaStatus', labels: ['取数执行'] },
     { key: 'fileCollectionStatus', labels: ['采集文件校验'] },
     { key: 'dbStatus', labels: ['数据入库'] },
     { key: 'inspectionStatus', labels: ['数据校验'] },
-    { key: 'operation', labels: ['操作'] }
+    { key: 'operation', labels: ['操作'], aliases: ['action'] }
   ];
+  // 线上自定义字段可拖拽列表仅标注 data-rbd-droppable-id="task-execute-field-setting"（class 为 list___RjHZx），
+  // 并无 .task-execute-field-setting 类名；保留 FALLBACK 选择器以兼容旧版/测试 DOM。
+  const FIELD_DROPPABLE_SELECTOR = '[data-rbd-droppable-id="task-execute-field-setting"]';
+  const FIELD_PANEL_FALLBACK_SELECTOR = '.task-execute-field-setting';
 
   const planBotById = new Map();        // planId(string) -> botName
   const planBotByJobUuid = new Map();   // jobUuid(string) -> botName
@@ -2401,6 +2420,10 @@
     return labels.includes('计划名称') && labels.includes('操作');
   }
 
+  function findColDefByKey(key) {
+    return NATIVE_COL_ORDER.find(c => c.key === key || c.aliases?.includes(key));
+  }
+
   function candidateLabelsForKey(key, extraLabel) {
     const out = [];
     const push = v => {
@@ -2409,7 +2432,7 @@
     };
     push(observedFieldMeta.get(key));
     push(extraLabel);
-    const def = NATIVE_COL_ORDER.find(c => c.key === key);
+    const def = findColDefByKey(key);
     if (def) def.labels.forEach(push);
     return out;
   }
@@ -2427,21 +2450,31 @@
   }
 
   function resolveBotInsertIndex(nativeThs) {
+    // 表格第 0 列是复选框列（.ant-table-selection-column），夹紧下界 >= firstDataIdx，
+    // 确保把「机器人」拖到「计划名称」之前时仍落在复选框列右侧。
+    const firstDataIdx = nativeThs.findIndex(th => !th.classList?.contains('ant-table-selection-column'));
+    const minIdx = firstDataIdx >= 0 ? firstDataIdx : 0;
     const opIdx = findNativeThIndex(nativeThs, 'operation', '操作');
-    const maxIdx = opIdx >= 0 ? opIdx : nativeThs.length;
+    const maxIdx = Math.max(minIdx, opIdx >= 0 ? opIdx : nativeThs.length);
+    const clampIdx = idx => Math.max(minIdx, Math.min(idx, maxIdx));
     const { anchor } = botColConfig;
 
     const directIdx = findNativeThIndex(nativeThs, anchor.key, anchor.label);
     if (directIdx >= 0) {
-      if (isOperationCol(anchor.key, anchor.label)) return Math.min(directIdx, maxIdx);
-      return Math.min(anchor.side === 'before' ? directIdx : directIdx + 1, maxIdx);
+      if (isOperationCol(anchor.key, anchor.label)) return clampIdx(directIdx);
+      return clampIdx(anchor.side === 'before' ? directIdx : directIdx + 1);
     }
 
     const orderList = observedFieldOrder.length
       ? observedFieldOrder
       : NATIVE_COL_ORDER.map(c => ({ key: c.key, label: c.labels[0] }));
     const anchorLabels = candidateLabelsForKey(anchor.key, anchor.label);
-    const anchorPos = orderList.findIndex(c => c.key === anchor.key || anchorLabels.includes(normalizeColText(c.label)));
+    const anchorDef = findColDefByKey(anchor.key);
+    const anchorPos = orderList.findIndex(c =>
+      c.key === anchor.key
+      || anchorDef?.aliases?.includes(c.key)
+      || anchorLabels.includes(normalizeColText(c.label))
+    );
 
     if (anchorPos >= 0) {
       const firstStep = anchor.side === 'after' ? -1 : 1;
@@ -2452,7 +2485,7 @@
           const visIdx = findNativeThIndex(nativeThs, item.key, item.label);
           if (visIdx >= 0) {
             const after = step < 0;
-            return Math.min(after ? visIdx + 1 : visIdx, maxIdx);
+            return clampIdx(after ? visIdx + 1 : visIdx);
           }
         }
       }
@@ -2611,12 +2644,33 @@
   }
 
   // ── 自定义字段弹窗融合与指针拖拽 ─────────────────────────────
+  // 线上 Antd Popover 中「恢复默认」（a.reset___EXt5g）位于 .header___UWFdL，
+  // 与可拖拽列表 [data-rbd-droppable-id="task-execute-field-setting"] 互为兄弟节点；
+  // 因此 findFieldSettingPanel() 向上取 .ant-popover-inner-content / .ant-popover 覆盖面板与「恢复默认」，
+  // findFieldSettingList() 则返回字段列表容器本身。
+  function findFieldSettingList(root = document) {
+    if (!root) return null;
+    if (root.matches?.(FIELD_DROPPABLE_SELECTOR)) return root;
+    return root.querySelector?.(FIELD_DROPPABLE_SELECTOR) || null;
+  }
+
   function findFieldSettingPanel() {
-    return document.querySelector('.task-execute-field-setting');
+    const droppable = document.querySelector(FIELD_DROPPABLE_SELECTOR);
+    if (droppable) {
+      const popoverContent = droppable.closest?.('.ant-popover-inner-content, .ant-popover, .task-execute-field-setting');
+      if (popoverContent) return popoverContent;
+      const parent = droppable.parentElement;
+      if (parent && parent !== document.body && parent !== document.documentElement) {
+        return parent;
+      }
+      return droppable;
+    }
+    return document.querySelector(FIELD_PANEL_FALLBACK_SELECTOR);
   }
 
   function collectNativeFieldItems(panel) {
-    const items = Array.from(panel.querySelectorAll('[data-rbd-draggable-id]'));
+    const listEl = findFieldSettingList(panel) || panel;
+    const items = Array.from(listEl.querySelectorAll('[data-rbd-draggable-id]'));
     observedFieldOrder = [];
     for (const el of items) {
       const key = String(el.getAttribute('data-rbd-draggable-id') || '').trim();
@@ -2813,31 +2867,43 @@
 
     checkboxWrap.appendChild(input);
     checkboxWrap.appendChild(inner);
+    label.appendChild(checkboxWrap);
 
     const textSpan = document.createElement('span');
+    textSpan.className = 'qsb-field-label';
+    textSpan.title = BOT_COL_LABEL;
     textSpan.textContent = BOT_COL_LABEL;
 
-    label.appendChild(checkboxWrap);
-    label.appendChild(textSpan);
-
     const handle = document.createElement('span');
-    handle.className = 'qsb-field-handle';
+    handle.className = 'anticon anticon-holder qsb-field-handle';
     handle.title = '拖动调整列顺序';
-    handle.innerHTML = '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">'
-      + '<circle cx="5" cy="3" r="1.3"/><circle cx="11" cy="3" r="1.3"/>'
-      + '<circle cx="5" cy="8" r="1.3"/><circle cx="11" cy="8" r="1.3"/>'
-      + '<circle cx="5" cy="13" r="1.3"/><circle cx="11" cy="13" r="1.3"/></svg>';
+    handle.innerHTML = '<svg viewBox="64 64 896 896" width="1em" height="1em" fill="currentColor" aria-hidden="true">'
+      + '<path d="M300 276.5a56 56 0 1056-97 56 56 0 00-56 97zm0 284a56 56 0 1056-97 56 56 0 00-56 97z'
+      + 'M640 228a56 56 0 10112 0 56 56 0 00-112 0zm0 284a56 56 0 10112 0 56 56 0 00-112 0z'
+      + 'M300 844.5a56 56 0 1056-97 56 56 0 00-56 97zM640 796a56 56 0 10112 0 56 56 0 00-112 0z"></path></svg>';
 
     item.appendChild(label);
+    item.appendChild(textSpan);
     item.appendChild(handle);
 
-    input.addEventListener('change', () => {
+    const onToggleChange = () => {
       if (!isTaskExecuteActive()) return;
       botColConfig.visible = Boolean(input.checked);
       saveBotColConfig(botColConfig);
       updateFieldCheckboxVisual(item, botColConfig.visible);
       if (botColConfig.visible) ensureBotMapLoaded();
       syncBotColumn();
+    };
+
+    input.addEventListener('change', onToggleChange);
+    textSpan.addEventListener('click', () => {
+      if (!isTaskExecuteActive()) return;
+      if (typeof input.click === 'function') {
+        input.click();
+      } else {
+        input.checked = !input.checked;
+        onToggleChange();
+      }
     });
 
     handle.addEventListener('pointerdown', e => {
@@ -2873,7 +2939,7 @@
 
     const nativeItems = collectNativeFieldItems(panel);
     if (!nativeItems.length) return;
-    const listEl = nativeItems[0].parentElement;
+    const listEl = findFieldSettingList(panel) || nativeItems[0].parentElement;
     if (!listEl) return;
 
     const target = resolvePanelAnchorTarget(nativeItems);
@@ -2903,10 +2969,27 @@
 
   function ensureFieldSettingObserver() {
     if (fieldSettingObserver) return;
+    const containsFieldSetting = el => {
+      if (!el || el.nodeType !== 1) return false;
+      if (el.matches?.(`${FIELD_DROPPABLE_SELECTOR}, ${FIELD_PANEL_FALLBACK_SELECTOR}`)) return true;
+      return Boolean(el.querySelector?.(`${FIELD_DROPPABLE_SELECTOR}, ${FIELD_PANEL_FALLBACK_SELECTOR}`));
+    };
     const isFieldSettingMutation = m => {
-      if (m.target?.closest?.('.task-execute-field-setting')) return true;
+      // Antd Popover 通过切换 ant-popover-hidden 类控制显隐，监听 class 变化确保再次打开时重同步
+      if (m.type === 'attributes') {
+        return m.attributeName === 'class' && containsFieldSetting(m.target);
+      }
+      const target = m.target;
+      if (target?.closest?.(`${FIELD_DROPPABLE_SELECTOR}, ${FIELD_PANEL_FALLBACK_SELECTOR}`)) return true;
+      const popContent = target?.closest?.('.ant-popover-inner-content');
+      if (popContent && containsFieldSetting(popContent)) return true;
       for (const n of m.addedNodes || []) {
-        if (n.nodeType === 1 && (n.classList?.contains('task-execute-field-setting') || n.querySelector?.('.task-execute-field-setting'))) {
+        if (n.nodeType === 1 && (containsFieldSetting(n) || n.hasAttribute?.('data-rbd-draggable-id'))) {
+          return true;
+        }
+      }
+      for (const n of m.removedNodes || []) {
+        if (n.nodeType === 1 && (containsFieldSetting(n) || n.hasAttribute?.('data-rbd-draggable-id') || n.hasAttribute?.('data-qsb-bot-field'))) {
           return true;
         }
       }
@@ -2923,7 +3006,12 @@
         syncBotColumn();
       }, 0);
     });
-    fieldSettingObserver.observe(document.body, { childList: true, subtree: true });
+    fieldSettingObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class']
+    });
   }
 
   function disconnectFieldSettingObserver() {
