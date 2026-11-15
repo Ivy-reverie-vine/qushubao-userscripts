@@ -1602,3 +1602,449 @@ test('机器人列（真实页面结构）：识别 data-rbd-droppable-id 弹窗
   assert.equal(saved.anchor.key, 'storeName');
   assert.equal(tbl.table.querySelectorAll('[data-qsb-bot-col]').length, 0);
 });
+
+const STORE_ROUTE = '/mallQuan/accountStoreManagement';
+
+function makeStoreCompactForm(doc, { withAntdSelect = false } = {}) {
+  const form = doc.createElement('form');
+  form.className = 'ant-form';
+
+  const group = doc.createElement('span');
+  group.className = 'ant-input-group ant-input-group-compact';
+
+  const nativeSelect = doc.createElement('select');
+  for (const [val, label] of [['storeName', '店铺名称'], ['username', '账号'], ['verificationPhone', '验证手机号']]) {
+    const opt = doc.createElement('option');
+    opt.value = val;
+    opt.textContent = label;
+    nativeSelect.appendChild(opt);
+  }
+  nativeSelect.value = 'storeName';
+  group.appendChild(nativeSelect);
+
+  let antdSelect = null;
+  if (withAntdSelect) {
+    antdSelect = doc.createElement('div');
+    antdSelect.className = 'ant-select';
+    group.appendChild(antdSelect);
+  }
+
+  const input = doc.createElement('input');
+  input.type = 'text';
+  input.className = 'ant-input';
+  input.value = '';
+  group.appendChild(input);
+
+  const searchItem = doc.createElement('div');
+  searchItem.className = 'ant-form-item';
+  const searchContent = doc.createElement('div');
+  searchContent.className = 'ant-form-item-control-input-content';
+  searchContent.appendChild(group);
+  searchItem.appendChild(searchContent);
+  form.appendChild(searchItem);
+
+  const space = doc.createElement('div');
+  space.className = 'ant-space';
+  const item = doc.createElement('div');
+  item.className = 'ant-space-item';
+  const resetBtn = doc.createElement('button');
+  resetBtn.textContent = '重置';
+  resetBtn.getBoundingClientRect = () => ({ top: 159, height: 36, bottom: 195 });
+  item.appendChild(resetBtn);
+  space.appendChild(item);
+  form.appendChild(space);
+
+  doc.body.appendChild(form);
+  return { form, group, nativeSelect, antdSelect, input, resetBtn };
+}
+
+test('店铺账号管理：最小侵入扩展原生下拉(Pi与select)、外显ID列(19位ID保真)及teardown还原', async () => {
+  const doc = createRichDom();
+  const { group, nativeSelect } = makeStoreCompactForm(doc, { withAntdSelect: true });
+  const tbl = buildPlanTableInDoc(doc, {
+    headers: ['店铺名称', '平台', '账号状态', '操作'],
+    rows: [
+      { key: '1900000000000000001', cells: ['测试旗舰店A', '拼多多', '正常', '编辑'] },
+      { key: '1900000000000000002', cells: ['测试旗舰店B', '淘宝', '正常', '编辑'] },
+    ],
+  });
+  // row[0] 通过 Fiber record 兜底读取；row[1] 通过响应缓存（19位字符串ID防精度丢失）读取
+  tbl.tbody.children[1].__reactFiber$test = {
+    return: {
+      memoizedProps: {
+        record: { id: '1900000000000000001', bizStoreId: 'J032', enterpriseId: '991001' },
+      },
+    },
+  };
+  const phTr = doc.createElement('tr');
+  phTr.className = 'ant-table-placeholder';
+  const phTd = doc.createElement('td');
+  phTd.colSpan = 4;
+  phTd.textContent = '暂无数据';
+  phTr.appendChild(phTd);
+  tbl.tbody.appendChild(phTr);
+
+  let piOptionsInVm = null;
+  let renderedOptionValues = [];
+  let tableDataState = { current: 1, size: 20, total: 2, pages: 1, records: [] };
+  const stateHook = {
+    memoizedState: tableDataState,
+    next: null,
+    queue: {
+      dispatch(next) {
+        tableDataState = next;
+        stateHook.memoizedState = next;
+        szFiber.memoizedProps.tableData = next;
+        // 模拟 React 重渲染 Ri 时执行 (Pi || []).map(...)
+        if (piOptionsInVm) {
+          renderedOptionValues = Array.from(piOptionsInVm.map(item => item.value));
+        }
+      },
+    },
+  };
+  const ownerFiber = { memoizedState: stateHook, return: null };
+  const szFiber = {
+    memoizedProps: { tableData: tableDataState, onPageChange() {} },
+    return: ownerFiber,
+  };
+  tbl.wrapper.__reactFiber$test = { return: szFiber };
+
+  const env = createEnv({ pathname: STORE_ROUTE, customDocument: doc });
+  env.run();
+  // ensureInterceptor() 在 run() 同步阶段已包装 FakeXHR.prototype.send，借其拿到 VM realm Array
+  const VmArray = env.FakeXHR.prototype.send.constructor('return Array')();
+  const origVmMap = VmArray.prototype.map;
+  piOptionsInVm = VmArray.from([
+    { key: 'storeName', value: '店铺名称' },
+    { key: 'username', value: '账号' },
+    { key: 'verificationPhone', value: '验证手机号' },
+  ]);
+  env.flush();
+
+  // 不得新建额外独立搜索栏，直接扩展原生下拉与外置角标
+  assert.equal(doc.querySelector('.qsb-filter-bar'), null, '不得再额外注入独立的 .qsb-filter-bar 搜索栏');
+  assert.ok(doc.querySelector('.qsb-store-count-badge'), '应在原生搜索组右侧挂载计数角标');
+  assert.equal(group.classList.contains('qsb-store-compact-wrap'), true);
+
+  assert.deepEqual(
+    renderedOptionValues,
+    ['店铺名称', '账号', '验证手机号', '店铺/企业ID', '店铺ID', '企业ID'],
+    'Pi.map 当次渲染即应包含新增的 3 个 ID 检索选项'
+  );
+  assert.equal(VmArray.prototype.map, origVmMap, '捕获 Pi 后必须立即恢复 Array.prototype.map');
+  assert.equal(nativeSelect.children.length, 6);
+
+  // 触发一次原生接口响应，校验 19 位雪花 ID 字符串映射
+  const xhr = new env.FakeXHR();
+  xhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/store-account/page');
+  xhr.responseText = JSON.stringify({
+    code: '10000',
+    bizData: {
+      current: 1,
+      size: 20,
+      total: 2,
+      pages: 1,
+      records: [
+        { id: '1900000000000000001', storeName: '测试旗舰店A', bizStoreId: 'J032', enterpriseId: '991001' },
+        { id: '1900000000000000002', storeName: '测试旗舰店B', bizStoreId: 'B888', enterpriseId: '1900000000000000009' },
+      ],
+    },
+  });
+  xhr.send(JSON.stringify({ accountType: 1, pageNo: 1, pageSize: 20 }));
+  xhr.fire('load');
+  await env.flushAsync();
+
+  const thTexts = tbl.headTr.children.map(th => th.textContent);
+  assert.deepEqual(thTexts, ['店铺名称', '店铺ID', '企业ID', '平台', '账号状态', '操作']);
+  assert.equal(tbl.headTr.children[1].getAttribute('data-qsb-store-col'), 'bizStoreId');
+  assert.equal(tbl.headTr.children[2].getAttribute('data-qsb-store-col'), 'enterpriseId');
+
+  const dataRows = tbl.tbody.querySelectorAll('tr.ant-table-row');
+  assert.equal(dataRows[0].children[1].textContent, 'J032');
+  assert.equal(dataRows[0].children[2].textContent, '991001');
+  assert.equal(dataRows[1].children[1].textContent, 'B888');
+  assert.equal(
+    dataRows[1].children[2].textContent,
+    '1900000000000000009',
+    '19位雪花ID末尾数字不得被 Number 精度截断'
+  );
+  assert.equal(phTd.colSpan, 6, '空状态占位单元格 colSpan 应同步 +2');
+  assert.equal(phTd.getAttribute('data-qsb-orig-colspan'), '4');
+
+  // 离开路由：还原 Pi 数组与 select、清理角标/新增列/placeholder colSpan、断开 observer
+  env.push('/mallQuan/other');
+  assert.deepEqual(Array.from(piOptionsInVm).map(o => o.key), ['storeName', 'username', 'verificationPhone']);
+  assert.equal(nativeSelect.children.length, 3);
+  assert.equal(doc.querySelector('.qsb-store-count-badge'), null);
+  assert.equal(group.classList.contains('qsb-store-compact-wrap'), false);
+  assert.equal(doc.querySelectorAll('[data-qsb-store-col]').length, 0);
+  assert.equal(phTd.colSpan, 4, 'teardown 应恢复原 colSpan');
+  assert.equal(phTd.getAttribute('data-qsb-orig-colspan'), null);
+  assert.equal(env.observerInstances.filter(o => o.connected).length, 0);
+});
+
+test('店铺账号管理：原生选项零干扰，切到ID选项全量拉取(>=200ms间隔)、复用缓存、写接口与重置失效缓存', async () => {
+  const doc = createRichDom();
+  const { nativeSelect, input, resetBtn } = makeStoreCompactForm(doc);
+  const tbl = buildPlanTableInDoc(doc, {
+    headers: ['店铺名称', '平台', '操作'],
+    rows: [
+      { key: '1900000000000000011', cells: ['拼多多店1', '拼多多', '编辑'] },
+      { key: '1900000000000000012', cells: ['淘宝店2', '淘宝', '编辑'] },
+      { key: '1900000000000000013', cells: ['抖音店3', '抖音', '编辑'] },
+    ],
+  });
+
+  const env = createEnv({
+    pathname: STORE_ROUTE,
+    customDocument: doc,
+    onFetch(url, body) {
+      if (!url.includes('/store-account/page')) return null;
+      if (body.pageNo === 1) {
+        return {
+          code: '10000',
+          bizData: {
+            current: 1,
+            size: 500,
+            total: 502,
+            pages: 2,
+            records: [
+              { id: '1900000000000000011', storeName: '拼多多店1', bizStoreId: 'J032', enterpriseId: 'E100' },
+              { id: '1900000000000000012', storeName: '淘宝店2', bizStoreId: 'T999', enterpriseId: 'E200' },
+            ],
+          },
+        };
+      }
+      return {
+        code: '10000',
+        bizData: {
+          current: 2,
+          size: 500,
+          total: 502,
+          pages: 2,
+          records: [
+            { id: '1900000000000000013', storeName: '抖音店3', bizStoreId: 'D777', enterpriseId: '888' },
+          ],
+        },
+      };
+    },
+  });
+  env.boot();
+
+  // 记录原生查询条件 { accountType: 1, platform: 'pdd', pageNo: 1, pageSize: 20 }
+  const nativeXhr = new env.FakeXHR();
+  nativeXhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/store-account/page');
+  nativeXhr.responseText = JSON.stringify({
+    code: '10000',
+    bizData: {
+      current: 1,
+      size: 20,
+      total: 3,
+      pages: 1,
+      records: [
+        { id: '1900000000000000011', storeName: '拼多多店1', bizStoreId: 'J032', enterpriseId: 'E100' },
+        { id: '1900000000000000012', storeName: '淘宝店2', bizStoreId: 'T999', enterpriseId: 'E200' },
+        { id: '1900000000000000013', storeName: '抖音店3', bizStoreId: 'D777', enterpriseId: '888' },
+      ],
+    },
+  });
+  nativeXhr.send(JSON.stringify({ accountType: 1, platform: 'pdd', pageNo: 1, pageSize: 20 }));
+  nativeXhr.fire('load');
+  await env.flushAsync();
+
+  const badge = doc.querySelector('.qsb-store-count-badge');
+
+  // 0) 选中原生「店铺名称」时输入关键词：完全走原生搜索，不触发全量拉取且不高亮 ID 列
+  nativeSelect.value = 'storeName';
+  input.value = 'J032';
+  input.dispatchEvent({ type: 'input', target: input });
+  await env.flushAsync();
+  assert.equal(env.fetchCalls.filter(c => c.url.includes('/store-account/page')).length, 0, '原生搜索选项不得触发全量拉取');
+  assert.equal(badge.textContent, '');
+
+  // 1) 切至「店铺/企业ID」输入多ID（J032 与 888）：分页拉取 pageSize=500 且间隔 >=200ms
+  nativeSelect.value = 'storeOrEnterpriseId';
+  nativeSelect.dispatchEvent({ type: 'change', target: nativeSelect });
+  input.value = 'J032, 888';
+  input.dispatchEvent({ type: 'input', target: input });
+  await env.flushAsync();
+
+  const storeFetchCalls = env.fetchCalls.filter(c => c.url.includes('/store-account/page'));
+  assert.equal(storeFetchCalls.length, 2, 'pages=2 应分页拉取 2 次');
+  assert.equal(storeFetchCalls[0].body.pageSize, 500);
+  assert.equal(storeFetchCalls[0].body.accountType, 1);
+  assert.equal(storeFetchCalls[0].body.platform, 'pdd');
+  assert.equal(storeFetchCalls[1].body.pageNo, 2);
+  assert.ok(storeFetchCalls[1].at - storeFetchCalls[0].at >= 200, '分页拉取间隔应 >= 200ms');
+
+  const rows = tbl.tbody.querySelectorAll('tr.ant-table-row');
+  assert.equal(rows[0].style.display, '');
+  assert.equal(rows[1].style.display, 'none');
+  assert.equal(rows[2].style.display, '');
+  assert.ok(rows[0].children[1].querySelector('.qsb-highlight'), '命中店铺ID应高亮');
+  assert.ok(rows[2].children[2].querySelector('.qsb-highlight'), '命中企业ID应高亮');
+  assert.equal(badge.textContent, '匹配 2 / 3 条');
+
+  // 2) 切换原生下拉为仅搜「店铺ID」再切「企业ID」，均直接复用全量缓存
+  input.value = '888';
+  input.dispatchEvent({ type: 'input', target: input });
+  await env.flushAsync();
+  nativeSelect.value = 'bizStoreId';
+  nativeSelect.dispatchEvent({ type: 'change', target: nativeSelect });
+  await env.flushAsync();
+
+  assert.equal(env.fetchCalls.filter(c => c.url.includes('/store-account/page')).length, 2, '同条件下应直接复用缓存');
+  assert.equal(rows[2].style.display, 'none');
+  assert.equal(badge.textContent, '匹配 0 / 3 条');
+
+  nativeSelect.value = 'enterpriseId';
+  nativeSelect.dispatchEvent({ type: 'change', target: nativeSelect });
+  await env.flushAsync();
+  assert.equal(rows[2].style.display, '');
+  assert.equal(badge.textContent, '匹配 1 / 3 条');
+
+  // 切回原生「店铺名称」：立即清除角标、恢复全部行与消除 ID 高亮
+  nativeSelect.value = 'storeName';
+  nativeSelect.dispatchEvent({ type: 'change', target: nativeSelect });
+  await env.flushAsync();
+  assert.equal(badge.textContent, '');
+  assert.equal(rows.every(r => r.style.display === ''), true);
+  assert.equal(rows[2].children[2].querySelector('.qsb-highlight'), null);
+
+  // 3) 写操作 /store-account/delete 应使全量缓存失效，再次选择「店铺ID」搜索重新拉取
+  const delXhr = new env.FakeXHR();
+  delXhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/store-account/delete');
+  delXhr.responseText = JSON.stringify({ code: '10000', bizData: true });
+  delXhr.send(JSON.stringify({ ids: ['1900000000000000012'] }));
+  delXhr.fire('load');
+  await env.flushAsync();
+
+  nativeSelect.value = 'bizStoreId';
+  input.value = 'J032';
+  input.dispatchEvent({ type: 'input', target: input });
+  await env.flushAsync();
+  assert.equal(env.fetchCalls.filter(c => c.url.includes('/store-account/page')).length, 4, '写操作后缓存失效需重拉');
+
+  // 4) 点击原生「重置」按钮应恢复行、清空角标并使缓存失效
+  resetBtn.dispatchEvent({ type: 'click', target: resetBtn });
+  await env.flushAsync();
+  assert.equal(badge.textContent, '');
+  assert.equal(rows.every(r => r.style.display === ''), true);
+
+  const resetXhr = new env.FakeXHR();
+  resetXhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/store-account/page');
+  resetXhr.responseText = nativeXhr.responseText;
+  resetXhr.send(JSON.stringify({ accountType: 1, pageNo: 1, pageSize: 20 }));
+  resetXhr.fire('load');
+  await env.flushAsync();
+
+  input.value = 'J032';
+  nativeSelect.value = 'bizStoreId';
+  input.dispatchEvent({ type: 'input', target: input });
+  await env.flushAsync();
+  assert.equal(env.fetchCalls.filter(c => c.url.includes('/store-account/page')).length, 6, '原生重置后缓存失效需重拉');
+});
+
+test('店铺账号管理：React SzTable Fiber 跨页精确分发 tableData 与切回原生恢复原态', async () => {
+  const doc = createRichDom();
+  const { antdSelect } = makeStoreCompactForm(doc, { withAntdSelect: true });
+  const tbl = buildPlanTableInDoc(doc, {
+    headers: ['店铺名称', '平台', '操作'],
+    rows: [{ key: '1900000000000000101', cells: ['第一页店铺', '拼多多', '编辑'] }],
+  });
+
+  const initialTableData = {
+    current: 1,
+    size: 20,
+    total: 501,
+    pages: 26,
+    records: [
+      { id: '1900000000000000101', storeName: '第一页店铺', bizStoreId: 'P1_001', enterpriseId: 'E_001' },
+    ],
+  };
+  const dispatched = [];
+  const stateHook = {
+    memoizedState: initialTableData,
+    next: null,
+    queue: {
+      dispatch(next) {
+        dispatched.push(next);
+        stateHook.memoizedState = next;
+        szFiber.memoizedProps.tableData = next;
+      },
+    },
+  };
+  const ownerFiber = { memoizedState: stateHook, return: null };
+  const szFiber = {
+    memoizedProps: { tableData: initialTableData, onPageChange() {} },
+    return: ownerFiber,
+  };
+  tbl.wrapper.__reactFiber$test = { return: szFiber };
+  antdSelect.__reactFiber$test = { memoizedProps: { value: 'storeName' } };
+
+  const env = createEnv({
+    pathname: STORE_ROUTE,
+    customDocument: doc,
+    onFetch(url, body) {
+      if (!url.includes('/store-account/page')) return null;
+      assert.equal(body.accountType, 1);
+      assert.equal(body.pageSize, 500);
+      return {
+        code: '10000',
+        bizData: {
+          current: 1,
+          size: 500,
+          total: 2,
+          pages: 1,
+          records: [
+            { id: '1900000000000000101', storeName: '第一页店铺', bizStoreId: 'P1_001', enterpriseId: 'E_001' },
+            { id: '1900000000000000202', storeName: '跨页命中店铺', bizStoreId: 'CROSS_999', enterpriseId: 'E_999' },
+          ],
+        },
+      };
+    },
+  });
+  env.boot();
+  // extendNativeStoreSearchBox 初始化时触发 1 次克隆刷新以挂钩 Pi；清除初始化记录
+  dispatched.length = 0;
+
+  // 原生列表首次加载
+  const nativeXhr = new env.FakeXHR();
+  nativeXhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/store-account/page');
+  nativeXhr.responseText = JSON.stringify({ code: '10000', bizData: initialTableData });
+  nativeXhr.send(JSON.stringify({ accountType: 1, pageNo: 1, pageSize: 20 }));
+  nativeXhr.fire('load');
+  await env.flushAsync();
+
+  const badge = doc.querySelector('.qsb-store-count-badge');
+
+  // 模拟在原生控件切换为「店铺ID」并输入 'CROSS_999' 时，Ri 发出 { bizStoreId: 'CROSS_999' } 请求
+  antdSelect.__reactFiber$test.memoizedProps.value = 'bizStoreId';
+  const customSearchXhr = new env.FakeXHR();
+  customSearchXhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/store-account/page');
+  customSearchXhr.responseText = JSON.stringify({ code: '10000', bizData: initialTableData });
+  customSearchXhr.send(JSON.stringify({ accountType: 1, bizStoreId: 'CROSS_999', pageNo: 1, pageSize: 20 }));
+  customSearchXhr.fire('load');
+  await env.flushAsync();
+
+  assert.equal(dispatched.length, 1, '应拦截自定义 key 请求并下发跨页过滤结果');
+  assert.equal(dispatched[0].current, '1');
+  assert.equal(dispatched[0].size, '20');
+  assert.equal(dispatched[0].total, '1');
+  assert.equal(dispatched[0].pages, '1');
+  assert.equal(dispatched[0].records.length, 1);
+  assert.equal(dispatched[0].records[0].id, '1900000000000000202');
+  assert.equal(badge.textContent, '匹配 1 / 2 条');
+
+  // 模拟切回原生「店铺名称」或清空：Ri 发出不含自定义 key 的原生请求
+  antdSelect.__reactFiber$test.memoizedProps.value = 'storeName';
+  const backNativeXhr = new env.FakeXHR();
+  backNativeXhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/store-account/page');
+  backNativeXhr.responseText = JSON.stringify({ code: '10000', bizData: initialTableData });
+  backNativeXhr.send(JSON.stringify({ accountType: 1, storeName: '第一页', pageNo: 1, pageSize: 20 }));
+  backNativeXhr.fire('load');
+  await env.flushAsync();
+
+  assert.equal(badge.textContent, '', '切回原生选项应隐藏检索计数角标');
+  assert.equal(dispatched.length, 1, '切回原生选项后不该再以过滤态覆写原生列表');
+});

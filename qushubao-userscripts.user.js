@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.4.1
-// @description  任务运行记录店铺筛选、异常外显与「机器人」自定义列 + 数据中心表字段导出 Excel（单表 / 连接器多 Sheet）与启用表名复制
+// @version      1.5.0
+// @description  任务运行记录店铺筛选、异常外显与「机器人」自定义列 + 数据中心表字段导出 Excel（单表 / 连接器多 Sheet）与启用表名复制 + 店铺账号管理按店铺ID/企业ID搜索与列外显
 // @author       青藤
 // @icon         http://dep-cloud-fe-ops.ii-ai.tech/favicon.png
 // @match        https://dep.ai-indeed.com/*
@@ -19,9 +19,11 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.4.1';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.5.0';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
+  const ACCOUNT_STORE_ROUTE = /^\/mallQuan\/accountStoreManagement/;  // 店铺账号管理页路由
+  const STORE_ACCOUNT_PAGE_SIZE = 500; // 店铺账号全量检索单页拉取条数
   const ROUTE_POLL_MS = 1000;          // 路由变化兜底轮询间隔
   const API_BASE = '/frameWorkPortal/opt/qymall/1.0.0';
   const PRELOAD_CONCURRENCY = 2;      // 后台预加载并发数
@@ -233,7 +235,9 @@
 
     // 3. 回退兜底：localStorage / sessionStorage
     try {
-      const raw = localStorage.getItem('Admin-Token')
+      const raw = sessionStorage.getItem('SHIZAI_DIGITAL_EMPLOYEE_PORTAL_TAB_TOKEN')
+        || localStorage.getItem('SHIZAI_DIGITAL_EMPLOYEE_PORTAL_USER_TOKEN')
+        || localStorage.getItem('Admin-Token')
         || localStorage.getItem('token')
         || sessionStorage.getItem('Admin-Token')
         || sessionStorage.getItem('token');
@@ -579,6 +583,39 @@
         pointer-events: none;
         z-index: 100002;
         box-shadow: 0 0 0 1px rgba(24,144,255,0.2);
+      }
+
+      /* 店铺账号管理：原生搜索框微调与表格外显列 */
+      .qsb-store-compact-parent {
+        display: inline-flex;
+        align-items: center;
+        flex-wrap: nowrap;
+      }
+      .qsb-store-compact-wrap {
+        display: inline-flex !important;
+        align-items: center;
+        flex-wrap: nowrap;
+        width: auto !important;
+      }
+      .qsb-store-compact-wrap > .ant-select:first-child {
+        width: 118px !important;
+      }
+      .qsb-store-count-badge {
+        margin-left: 8px;
+        font-size: 12px;
+        color: #666;
+        white-space: nowrap;
+      }
+      .qsb-store-count-badge:empty {
+        display: none;
+      }
+      .qsb-store-th,
+      .qsb-store-cell {
+        width: 110px;
+        max-width: 150px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
     `;
     document.head.appendChild(style);
@@ -3633,6 +3670,1076 @@
       tableDefCache.clear();
       document.querySelectorAll('[data-qsb-export], button[data-qsb-copy], .qsb-copy-panel')
         .forEach(el => el.remove());
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // 功能 5：店铺账号管理页（复用原生搜索框按店铺ID/企业ID检索 + 表格列外显）
+  // ═══════════════════════════════════════════════════════════════
+  const STORE_FILTER_KEYS = [
+    'channel', 'platform', 'groupId', 'siteId', 'browserId',
+    'storeName', 'username', 'verificationPhone'
+  ];
+  const STORE_EXTRA_COLS = [
+    { key: 'bizStoreId', label: '店铺ID', width: 110 },
+    { key: 'enterpriseId', label: '企业ID', width: 110 }
+  ];
+  const STORE_CUSTOM_OPTIONS = [
+    { key: 'storeOrEnterpriseId', value: '店铺/企业ID', field: 'all' },
+    { key: 'bizStoreId', value: '店铺ID', field: 'bizStoreId' },
+    { key: 'enterpriseId', value: '企业ID', field: 'enterpriseId' }
+  ];
+  const STORE_CUSTOM_KEY_TO_FIELD = {
+    storeOrEnterpriseId: 'all',
+    bizStoreId: 'bizStoreId',
+    enterpriseId: 'enterpriseId'
+  };
+  const STORE_CUSTOM_LABEL_TO_KEY = {
+    '店铺/企业ID': 'storeOrEnterpriseId',
+    '店铺ID': 'bizStoreId',
+    '企业ID': 'enterpriseId'
+  };
+
+  const storeAccountById = new Map();
+  let storeSearchField = null;
+  let activeStoreCustomTokens = [];
+  let storeSearchInputTimer = null;
+  let storeMapHookTimer = null;
+  let storeAllCache = { key: '', promise: null, records: null, total: 0 };
+  let storeSearchAbort = null;
+  let storeSearchRunId = 0;
+  let internalStoreFetchCount = 0;
+  let lastStoreReqQuery = null;
+  let lastNativeStoreBizData = null;
+  let injectedStoreBizData = null;
+  let storeFilterPageNo = 1;
+  let storeFilterPageSize = 20;
+  let storeObserver = null;
+  let storeSyncTimer = null;
+  let storeGuardTimer = null;
+  let storeClickBound = false;
+  let storeFormBound = false;
+  let storeResizeBound = false;
+  let capturedStoreOptionsArray = null;
+  let origArrayMap = null;
+  let hookedArrayMap = null;
+
+  function isAccountStoreActive() {
+    return activePage?.def?.name === 'accountStore' && ACCOUNT_STORE_ROUTE.test(location.pathname);
+  }
+
+  function clearStoreAllCache() {
+    if (storeSearchAbort) {
+      storeSearchAbort.abort();
+      storeSearchAbort = null;
+    }
+    storeAllCache = { key: '', promise: null, records: null, total: 0 };
+  }
+
+  function uninstallStoreOptionsMapHook() {
+    clearTimeout(storeMapHookTimer);
+    storeMapHookTimer = null;
+    if (origArrayMap && Array.prototype.map === hookedArrayMap) {
+      Array.prototype.map = origArrayMap;
+    }
+    hookedArrayMap = null;
+    origArrayMap = null;
+  }
+
+  function appendCustomStoreOptions(arr) {
+    if (!Array.isArray(arr)) return false;
+    capturedStoreOptionsArray = arr;
+    let changed = false;
+    for (const opt of STORE_CUSTOM_OPTIONS) {
+      if (!arr.some(item => item && item.key === opt.key)) {
+        arr.push({ key: opt.key, value: opt.value, __qsb: true });
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  function installStoreOptionsMapHook() {
+    if (capturedStoreOptionsArray) {
+      appendCustomStoreOptions(capturedStoreOptionsArray);
+      return;
+    }
+    if (hookedArrayMap) return;
+    origArrayMap = Array.prototype.map;
+    hookedArrayMap = function qsbStoreOptionsMapHook(...args) {
+      const baseMap = origArrayMap;
+      try {
+        if (
+          Array.isArray(this)
+          && this.length >= 3
+          && this[0]?.key === 'storeName'
+          && this[1]?.key === 'username'
+          && this[2]?.key === 'verificationPhone'
+        ) {
+          appendCustomStoreOptions(this);
+          uninstallStoreOptionsMapHook();
+        }
+      } catch (_) { }
+      return (baseMap || Array.prototype.map).apply(this, args);
+    };
+    Array.prototype.map = hookedArrayMap;
+    clearTimeout(storeMapHookTimer);
+    storeMapHookTimer = setTimeout(() => {
+      uninstallStoreOptionsMapHook();
+    }, 2000);
+  }
+
+  function parseStoreRequestBody(body) {
+    if (!body) return {};
+    if (typeof body === 'string') {
+      try { return JSON.parse(body); } catch (_) { return {}; }
+    }
+    if (typeof body === 'object' && !(typeof FormData !== 'undefined' && body instanceof FormData)) {
+      return body;
+    }
+    return {};
+  }
+
+  /** 构造当前原生查询过滤基线（剥离分页字段，用于按条件全量检索与缓存） */
+  function extractStoreBaseQuery(parsed) {
+    const query = {};
+    if (parsed && parsed.accountType != null && parsed.accountType !== '') {
+      query.accountType = parsed.accountType;
+    } else {
+      const sp = new URLSearchParams(location.search || '');
+      const ip = sp.get('industryProducts');
+      query.accountType = ip ? Number(ip) : 1;
+    }
+    for (const key of STORE_FILTER_KEYS) {
+      const val = parsed?.[key];
+      if (val != null && String(val).trim() !== '') {
+        query[key] = val;
+      }
+    }
+    return query;
+  }
+
+  function makeStoreBaseQueryKey(query) {
+    const keys = Object.keys(query).sort();
+    return JSON.stringify(keys.map(k => [k, query[k]]));
+  }
+
+  function getActiveStoreBaseQuery() {
+    return lastStoreReqQuery || extractStoreBaseQuery(null);
+  }
+
+  function parseStoreSearchTokens(raw) {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) return [];
+    return Array.from(new Set(trimmed.split(/[\s,，;；]+/).map(s => s.trim()).filter(Boolean)));
+  }
+
+  function findNativeStoreSearchNodes() {
+    const forms = document.querySelectorAll('form.ant-form, form');
+    for (const form of forms) {
+      const compactGroup = form.querySelector('.ant-input-group-compact');
+      if (compactGroup) {
+        const antdSelect = compactGroup.querySelector('.ant-select');
+        const nativeSelect = compactGroup.querySelector('select');
+        const input = compactGroup.querySelector('input.ant-input')
+          || compactGroup.querySelector('input[type="text"]')
+          || Array.from(compactGroup.querySelectorAll('input')).find(i => i.type !== 'search');
+        if ((antdSelect || nativeSelect) && input) {
+          return { form, compactGroup, antdSelect, nativeSelect, input };
+        }
+      }
+      const nativeSelect = form.querySelector('select');
+      const input = form.querySelector('input');
+      if (nativeSelect && input) {
+        const compactLike = nativeSelect.parentElement || form;
+        return { form, compactGroup: compactLike, antdSelect: null, nativeSelect, input };
+      }
+    }
+    return null;
+  }
+
+  function getNativeStoreSearchState() {
+    const nodes = findNativeStoreSearchNodes();
+    if (!nodes) return { key: '', customField: null, rawValue: '', nodes: null };
+
+    let key = '';
+    if (nodes.antdSelect) {
+      const fKey = Object.keys(nodes.antdSelect).find(k =>
+        k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+      let cur = fKey ? nodes.antdSelect[fKey] : null;
+      for (let i = 0; i < 16 && cur; i++, cur = cur.return) {
+        const val = cur.memoizedProps?.value;
+        if (typeof val === 'string' && val) {
+          key = val;
+          break;
+        }
+      }
+      if (!key) {
+        const label = nodes.antdSelect.querySelector('.ant-select-selection-item')?.textContent?.trim();
+        if (label && STORE_CUSTOM_LABEL_TO_KEY[label]) key = STORE_CUSTOM_LABEL_TO_KEY[label];
+      }
+    }
+    if (!key && nodes.nativeSelect) {
+      key = String(nodes.nativeSelect.value || '');
+    }
+
+    const customField = STORE_CUSTOM_KEY_TO_FIELD[key] || null;
+    const rawValue = String(nodes.input?.value || '');
+    return { key, customField, rawValue, nodes };
+  }
+
+  function hasCustomAntdOptions(antdSelect) {
+    if (!antdSelect) return false;
+    const fKey = Object.keys(antdSelect).find(k =>
+      k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+    let cur = fKey ? antdSelect[fKey] : null;
+    for (let i = 0; i < 16 && cur; i++, cur = cur.return) {
+      const ch = cur.memoizedProps?.children;
+      if (Array.isArray(ch) && ch.some(c => c?.props?.optionData?.key === 'bizStoreId' || c?.props?.value === 'bizStoreId')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function cacheStoreRecords(records) {
+    if (!Array.isArray(records)) return;
+    for (const rec of records) {
+      if (rec && rec.id != null) {
+        const idStr = String(rec.id).trim();
+        if (idStr) storeAccountById.set(idStr, rec);
+      }
+    }
+  }
+
+  /** 按当前 token 列表匹配店铺ID或企业ID；命中时返回匹配的原关键词以供高亮 */
+  function matchStoreValueToken(val, tokenPairs) {
+    if (val == null) return null;
+    const text = String(val).trim();
+    if (!text) return null;
+    const lower = text.toLowerCase();
+    for (const tok of tokenPairs) {
+      if (lower.includes(tok.lower)) return tok.raw;
+    }
+    return null;
+  }
+
+  function matchStoreRecord(record, field, tokens) {
+    if (!record || !tokens.length) return false;
+    const tokenPairs = tokens.map(raw => ({ raw, lower: raw.toLowerCase() }));
+    if (field === 'bizStoreId') return Boolean(matchStoreValueToken(record.bizStoreId, tokenPairs));
+    if (field === 'enterpriseId') return Boolean(matchStoreValueToken(record.enterpriseId, tokenPairs));
+    return Boolean(
+      matchStoreValueToken(record.bizStoreId, tokenPairs)
+      || matchStoreValueToken(record.enterpriseId, tokenPairs)
+    );
+  }
+
+  /** 从 React Fiber 定位 SzTable 及其父组件持有的 tableData state dispatcher */
+  function findStoreTableStateControl({ allowEmptyRecords = false } = {}) {
+    const wrappers = Array.from(document.querySelectorAll('.ant-table-wrapper'));
+    const wrapper = wrappers.find(w => !w.closest('.ant-modal') && !w.closest('.ant-drawer')) || getMainTable();
+    if (!wrapper) return null;
+
+    const fKey = Object.keys(wrapper).find(k =>
+      k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+    if (!fKey) return null;
+
+    let szFiber = null;
+    let cur = wrapper[fKey];
+    for (let i = 0; i < 25 && cur; i++, cur = cur.return) {
+      const mp = cur.memoizedProps;
+      if (mp && mp.tableData && typeof mp.onPageChange === 'function') {
+        szFiber = cur;
+        break;
+      }
+    }
+    if (!szFiber) return null;
+
+    const tableDataRef = szFiber.memoizedProps.tableData;
+    let owner = szFiber.return;
+    for (let i = 0; i < 15 && owner; i++, owner = owner.return) {
+      let hook = owner.memoizedState;
+      for (let idx = 0; hook && idx < 60; idx++, hook = hook.next) {
+        if (hook.memoizedState === tableDataRef && typeof hook.queue?.dispatch === 'function') {
+          if (
+            allowEmptyRecords
+            || Array.isArray(tableDataRef.records)
+            || tableDataRef === injectedStoreBizData
+            || tableDataRef === lastNativeStoreBizData
+          ) {
+            return { dispatch: hook.queue.dispatch, tableData: tableDataRef };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function extractStoreRecordFromRow(row) {
+    if (!row) return null;
+    try {
+      const fKey = Object.keys(row).find(k =>
+        k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+      if (fKey) {
+        let fiber = row[fKey];
+        for (let depth = 0; fiber && depth < 20; depth++) {
+          const props = fiber.memoizedProps || fiber.pendingProps;
+          if (props?.record && typeof props.record === 'object') {
+            if (props.record.id != null) {
+              storeAccountById.set(String(props.record.id).trim(), props.record);
+            }
+            return props.record;
+          }
+          fiber = fiber.return;
+        }
+      }
+    } catch (_) { }
+    return null;
+  }
+
+  function isStoreColNode(el) {
+    return Boolean(el && el.hasAttribute?.('data-qsb-store-col'));
+  }
+
+  /** 将节点对（店铺ID / 企业ID）确保挂载于容器指定列位置 */
+  function ensureStoreColsAt(container, insertIdx, createPair) {
+    if (!container) return { nodes: [], changed: false };
+    const ch = container.children || [];
+    const c0 = ch[insertIdx];
+    const c1 = ch[insertIdx + 1];
+    if (c0?.getAttribute?.('data-qsb-store-col') === STORE_EXTRA_COLS[0].key
+      && c1?.getAttribute?.('data-qsb-store-col') === STORE_EXTRA_COLS[1].key) {
+      return { nodes: [c0, c1], changed: false };
+    }
+    Array.from(ch).filter(isStoreColNode).forEach(el => el.remove());
+    const pair = createPair();
+    const ref = container.children?.[insertIdx] || null;
+    for (const node of pair) {
+      if (container.insertBefore) container.insertBefore(node, ref);
+      else container.appendChild(node);
+    }
+    return { nodes: pair, changed: true };
+  }
+
+  /** 同步 split-header（table-layout:fixed）与 body（table-layout:auto）的列宽，杜绝表头/表体错位 */
+  function syncSplitTableColWidths(mainTable) {
+    if (!mainTable) return;
+    const headerTable = mainTable.querySelector('.ant-table-header table');
+    const bodyTable = mainTable.querySelector('.ant-table-body table');
+    if (!headerTable || !bodyTable) return;
+
+    const headerCols = Array.from(headerTable.querySelectorAll('colgroup col'));
+    let sourceCells = Array.from(bodyTable.querySelectorAll('.ant-table-measure-row td'));
+    if (!sourceCells.length || typeof sourceCells[0].getBoundingClientRect !== 'function') {
+      const firstRow = bodyTable.querySelector('.ant-table-tbody tr.ant-table-row');
+      sourceCells = firstRow ? Array.from(firstRow.children || []) : [];
+    }
+    if (!sourceCells.length || headerCols.length < sourceCells.length) return;
+
+    let sumW = 0;
+    let measured = 0;
+    for (let i = 0; i < sourceCells.length; i++) {
+      const cell = sourceCells[i];
+      if (typeof cell.getBoundingClientRect !== 'function') continue;
+      const w = cell.getBoundingClientRect().width;
+      if (!(w > 0)) continue;
+      measured++;
+      sumW += w;
+      const col = headerCols[i];
+      if (!col) continue;
+      if (!isStoreColNode(col) && col.dataset && !('qsbOrigWidth' in col.dataset)) {
+        col.dataset.qsbOrigWidth = col.style.width || '';
+      }
+      const px = (Math.round(w * 10) / 10) + 'px';
+      if (col.style.width !== px) col.style.width = px;
+      if (col.style.minWidth !== px) col.style.minWidth = px;
+    }
+
+    if (!measured) return;
+    const extraCol = headerCols[sourceCells.length];
+    const scrollW = extraCol ? (parseFloat(extraCol.style.width) || 0) : 0;
+    const parentW = headerTable.parentElement?.clientWidth || 0;
+    if (headerTable.dataset && !('qsbOrigWidth' in headerTable.dataset)) {
+      headerTable.dataset.qsbOrigWidth = headerTable.style.width || '';
+    }
+    if (parentW > 0 && sumW + scrollW > parentW + 1) {
+      headerTable.style.width = Math.round(sumW + scrollW) + 'px';
+    } else if (headerTable.dataset && 'qsbOrigWidth' in headerTable.dataset) {
+      headerTable.style.width = headerTable.dataset.qsbOrigWidth;
+    }
+  }
+
+  function removeStoreColumns(mainTable) {
+    if (!mainTable) return;
+    const nodes = mainTable.querySelectorAll('[data-qsb-store-col]');
+    const placeholders = mainTable.querySelectorAll('td[data-qsb-orig-colspan]');
+    const headerTable = mainTable.querySelector('.ant-table-header table');
+    const origCols = mainTable.querySelectorAll('col[data-qsb-orig-width]');
+    if (!nodes.length && !placeholders.length && !origCols.length) return;
+
+    isSelfModifyingDOM = true;
+    try {
+      nodes.forEach(el => el.remove());
+      placeholders.forEach(td => {
+        const orig = parseInt(td.getAttribute('data-qsb-orig-colspan'), 10);
+        if (Number.isFinite(orig)) td.colSpan = orig;
+        td.removeAttribute('data-qsb-orig-colspan');
+      });
+      origCols.forEach(col => {
+        if (col.dataset && 'qsbOrigWidth' in col.dataset) {
+          col.style.width = col.dataset.qsbOrigWidth;
+          col.style.minWidth = '';
+          delete col.dataset.qsbOrigWidth;
+        }
+      });
+      if (headerTable?.dataset && 'qsbOrigWidth' in headerTable.dataset) {
+        headerTable.style.width = headerTable.dataset.qsbOrigWidth;
+        delete headerTable.dataset.qsbOrigWidth;
+      }
+    } finally {
+      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
+    }
+  }
+
+  /** 在主表格「店铺名称」列后注入「店铺ID」「企业ID」列并刷新数值与关键词高亮 */
+  function syncStoreColumns() {
+    if (!isAccountStoreActive()) return;
+    const mainTable = getMainTable();
+    if (!mainTable) return;
+
+    const headerTr = mainTable.querySelector('.ant-table-header thead tr')
+      || mainTable.querySelector('.ant-table-thead tr')
+      || mainTable.querySelector('thead tr');
+    if (!headerTr) return;
+
+    const nativeThs = Array.from(headerTr.children || []).filter(th => !isStoreColNode(th));
+    const storeNameIdx = nativeThs.findIndex(th => normalizeColText(th.textContent) === '店铺名称');
+    if (storeNameIdx < 0) return;
+
+    const insertIdx = storeNameIdx + 1;
+    const sampleTh = nativeThs[storeNameIdx] || nativeThs[0];
+    const baseCellClass = stripFixClasses(sampleTh?.className) || 'ant-table-cell';
+    const highlightField = storeSearchField;
+    const tokens = highlightField ? activeStoreCustomTokens : [];
+    const tokenPairs = tokens.map(raw => ({ raw, lower: raw.toLowerCase() }));
+
+    isSelfModifyingDOM = true;
+    try {
+      mainTable.querySelectorAll('colgroup').forEach(colgroup => {
+        const nativeCols = Array.from(colgroup.children || []).filter(c => !isStoreColNode(c));
+        if (nativeCols.length < insertIdx) return;
+        ensureStoreColsAt(colgroup, insertIdx, () => STORE_EXTRA_COLS.map(def => {
+          const col = document.createElement('col');
+          col.setAttribute('data-qsb-store-col', def.key);
+          col.style.width = `${def.width}px`;
+          col.style.minWidth = `${def.width}px`;
+          return col;
+        }));
+      });
+
+      ensureStoreColsAt(headerTr, insertIdx, () => STORE_EXTRA_COLS.map(def => {
+        const th = document.createElement('th');
+        th.className = `${baseCellClass} qsb-store-th`;
+        th.setAttribute('data-qsb-store-col', def.key);
+        th.textContent = def.label;
+        return th;
+      }));
+
+      mainTable.querySelectorAll('.ant-table-measure-row').forEach(measureRow => {
+        ensureStoreColsAt(measureRow, insertIdx, () => STORE_EXTRA_COLS.map(def => {
+          const td = document.createElement('td');
+          td.setAttribute('data-qsb-store-col', def.key);
+          td.style.padding = '0';
+          td.style.border = '0';
+          td.style.height = '0';
+          return td;
+        }));
+      });
+
+      mainTable.querySelectorAll('.ant-table-tbody tr.ant-table-row').forEach(row => {
+        const rowKey = row.getAttribute('data-row-key');
+        const rec = (rowKey && storeAccountById.get(rowKey)) || extractStoreRecordFromRow(row);
+        const { nodes } = ensureStoreColsAt(row, insertIdx, () => STORE_EXTRA_COLS.map(def => {
+          const td = document.createElement('td');
+          td.className = `${baseCellClass} qsb-store-cell`;
+          td.setAttribute('data-qsb-store-col', def.key);
+          return td;
+        }));
+        STORE_EXTRA_COLS.forEach((def, i) => {
+          const cell = nodes[i];
+          if (!cell) return;
+          const rawVal = rec && rec[def.key] != null ? String(rec[def.key]).trim() : '';
+          const displayText = rawVal || '-';
+          removeHighlight(cell);
+          if (cell.textContent !== displayText) cell.textContent = displayText;
+          if (cell.title !== rawVal) cell.title = rawVal;
+          const shouldHighlight = rawVal && tokenPairs.length && (highlightField === 'all' || highlightField === def.key);
+          if (shouldHighlight) {
+            const matchedTok = matchStoreValueToken(rawVal, tokenPairs);
+            if (matchedTok) highlightText(cell, matchedTok);
+          }
+        });
+      });
+
+      mainTable.querySelectorAll('.ant-table-tbody tr.ant-table-placeholder td').forEach(td => {
+        if (!(td.colSpan > 0)) return;
+        if (!td.hasAttribute('data-qsb-orig-colspan')) {
+          td.setAttribute('data-qsb-orig-colspan', String(td.colSpan));
+          td.colSpan += STORE_EXTRA_COLS.length;
+        }
+      });
+
+      syncSplitTableColWidths(mainTable);
+    } finally {
+      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
+    }
+  }
+
+  /** 分页拉取当前原生筛选条件下的全量店铺账号记录，遵循 ≥200ms 请求间隔 */
+  async function fetchAllStoreAccounts(baseQuery, signal, onProgress) {
+    let pageNo = 1;
+    let totalPages = 1;
+    let totalCount = 0;
+    const allRecords = [];
+    const seenIds = new Set();
+
+    while (pageNo <= totalPages) {
+      if (signal?.aborted) return null;
+      if (pageNo > 1) {
+        await sleep(REQUEST_INTERVAL_MS);
+        if (signal?.aborted) return null;
+      }
+
+      const body = { ...baseQuery, pageNo, pageSize: STORE_ACCOUNT_PAGE_SIZE };
+      internalStoreFetchCount++;
+      let reqPromise;
+      try {
+        reqPromise = apiPost('/store-account/page', body, signal);
+      } finally {
+        internalStoreFetchCount--;
+      }
+
+      const res = await reqPromise;
+      if (!res || String(res.code) !== '10000' || !res.bizData) {
+        throw new Error((res && res.msg) || 'store-account/page 请求失败');
+      }
+
+      const biz = res.bizData;
+      const records = Array.isArray(biz.records) ? biz.records : [];
+      for (const rec of records) {
+        if (!rec) continue;
+        const idStr = rec.id != null ? String(rec.id).trim() : '';
+        if (idStr) {
+          if (seenIds.has(idStr)) continue;
+          seenIds.add(idStr);
+          storeAccountById.set(idStr, rec);
+        }
+        allRecords.push(rec);
+      }
+
+      const pagesNum = parseInt(biz.pages, 10);
+      const totalNum = parseInt(biz.total, 10);
+      if (Number.isFinite(totalNum) && totalNum >= 0) totalCount = totalNum;
+      if (Number.isFinite(pagesNum) && pagesNum >= 1) {
+        totalPages = pagesNum;
+      } else if (Number.isFinite(totalNum) && totalNum >= 0) {
+        totalPages = Math.max(1, Math.ceil(totalNum / STORE_ACCOUNT_PAGE_SIZE));
+      }
+      onProgress?.(pageNo, totalPages);
+      if (!records.length) break;
+      pageNo++;
+    }
+
+    return { records: allRecords, total: totalCount || allRecords.length };
+  }
+
+  function restoreStoreDomFallbackRows() {
+    const mainTable = getMainTable();
+    if (!mainTable) return;
+    isSelfModifyingDOM = true;
+    try {
+      mainTable.querySelectorAll('.ant-table-tbody tr.ant-table-row').forEach(row => {
+        if (row.style.display !== '') row.style.display = '';
+      });
+    } finally {
+      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
+    }
+  }
+
+  function applyStoreDomFallbackFilter(tokens, field) {
+    const mainTable = getMainTable();
+    if (!mainTable) return;
+    const rows = mainTable.querySelectorAll('.ant-table-tbody tr.ant-table-row');
+    let visible = 0;
+
+    isSelfModifyingDOM = true;
+    try {
+      rows.forEach(row => {
+        const key = row.getAttribute('data-row-key');
+        const rec = (key && storeAccountById.get(key)) || extractStoreRecordFromRow(row);
+        if (!tokens.length) {
+          if (row.style.display !== '') row.style.display = '';
+          visible++;
+          return;
+        }
+        const matched = rec ? matchStoreRecord(rec, field, tokens) : false;
+        if (matched) {
+          if (row.style.display !== '') row.style.display = '';
+          visible++;
+        } else {
+          if (row.style.display !== 'none') row.style.display = 'none';
+        }
+      });
+      if (countBadge) {
+        countBadge.textContent = tokens.length ? `匹配 ${visible} / ${rows.length} 条` : '';
+      }
+    } finally {
+      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
+    }
+  }
+
+  function renderFilteredStoreRecords(allRecords, tokens, field) {
+    const ctrl = findStoreTableStateControl();
+    if (!ctrl) {
+      applyStoreDomFallbackFilter(tokens, field);
+      syncStoreColumns();
+      return;
+    }
+
+    const matched = allRecords.filter(rec => matchStoreRecord(rec, field, tokens));
+    const pageSize = Math.max(1, storeFilterPageSize || parseInt(lastNativeStoreBizData?.size, 10) || 20);
+    const totalPages = Math.max(1, Math.ceil(matched.length / pageSize));
+    const safePageNo = Math.min(Math.max(1, storeFilterPageNo), totalPages);
+    const startIdx = (safePageNo - 1) * pageSize;
+    const nextBizData = {
+      current: String(safePageNo),
+      size: String(pageSize),
+      total: String(matched.length),
+      pages: String(totalPages),
+      records: matched.slice(startIdx, startIdx + pageSize)
+    };
+
+    injectedStoreBizData = nextBizData;
+    ctrl.dispatch(nextBizData);
+    if (countBadge) {
+      countBadge.textContent = matched.length
+        ? `匹配 ${matched.length} / ${allRecords.length} 条`
+        : `未找到匹配 (共 ${allRecords.length} 条)`;
+    }
+    setTimeout(() => {
+      if (isAccountStoreActive()) syncStoreColumns();
+    }, 0);
+  }
+
+  async function applyStoreIdSearch(rawOverride) {
+    if (!isAccountStoreActive()) return;
+    const nativeState = getNativeStoreSearchState();
+    const field = storeSearchField || nativeState.customField;
+    const rawVal = rawOverride !== undefined ? String(rawOverride) : nativeState.rawValue;
+    const tokens = field ? parseStoreSearchTokens(rawVal) : [];
+    activeStoreCustomTokens = tokens;
+    const runId = ++storeSearchRunId;
+
+    if (!field || !tokens.length) {
+      if (storeSearchAbort) {
+        storeSearchAbort.abort();
+        storeSearchAbort = null;
+      }
+      clearTimeout(storeGuardTimer);
+      if (countBadge) countBadge.textContent = '';
+      const ctrl = findStoreTableStateControl();
+      if (ctrl && lastNativeStoreBizData) {
+        injectedStoreBizData = null;
+        ctrl.dispatch(lastNativeStoreBizData);
+        setTimeout(() => {
+          if (isAccountStoreActive()) syncStoreColumns();
+        }, 0);
+      } else {
+        applyStoreDomFallbackFilter([], field || 'all');
+        syncStoreColumns();
+      }
+      return;
+    }
+
+    const ctrl = findStoreTableStateControl();
+    if (!lastNativeStoreBizData && ctrl?.tableData && Array.isArray(ctrl.tableData.records) && ctrl.tableData !== injectedStoreBizData) {
+      lastNativeStoreBizData = ctrl.tableData;
+      cacheStoreRecords(ctrl.tableData.records);
+      if (ctrl.tableData.size) storeFilterPageSize = parseInt(ctrl.tableData.size, 10) || 20;
+    }
+
+    const baseQuery = getActiveStoreBaseQuery();
+    const baseKey = makeStoreBaseQueryKey(baseQuery);
+
+    if (storeAllCache.key === baseKey && Array.isArray(storeAllCache.records)) {
+      renderFilteredStoreRecords(storeAllCache.records, tokens, field);
+      return;
+    }
+
+    if (countBadge) countBadge.textContent = '全量检索中...';
+
+    let fetchPromise;
+    if (storeAllCache.key === baseKey && storeAllCache.promise) {
+      fetchPromise = storeAllCache.promise;
+    } else {
+      clearStoreAllCache();
+      storeSearchAbort = new AbortController();
+      const signal = storeSearchAbort.signal;
+      fetchPromise = fetchAllStoreAccounts(baseQuery, signal, (cur, pages) => {
+        if (runId !== storeSearchRunId || !isAccountStoreActive() || !countBadge) return;
+        countBadge.textContent = pages > 1 ? `全量检索中 (${cur}/${pages})...` : '全量检索中...';
+      });
+      storeAllCache = { key: baseKey, promise: fetchPromise, records: null, total: 0 };
+    }
+
+    try {
+      const result = await fetchPromise;
+      if (!result || runId !== storeSearchRunId || !isAccountStoreActive()) return;
+      if (storeAllCache.key === baseKey) {
+        storeAllCache = { key: baseKey, promise: null, records: result.records, total: result.total };
+      }
+      if (!activeStoreCustomTokens.length || !storeSearchField) return;
+      renderFilteredStoreRecords(result.records, activeStoreCustomTokens, storeSearchField);
+    } catch (err) {
+      if (err?.name === 'AbortError') return;
+      if (storeAllCache.key === baseKey) storeAllCache = { key: '', promise: null, records: null, total: 0 };
+      if (runId === storeSearchRunId && isAccountStoreActive() && countBadge) {
+        countBadge.textContent = '检索失败';
+      }
+      console.warn(LOG_TAG, '店铺账号全量检索失败:', err?.message || err);
+    }
+  }
+
+  /** 最小侵入扩展原生搜索栏：下拉加入 店铺/企业ID、店铺ID、企业ID，并在其右侧挂载计数角标 */
+  function extendNativeStoreSearchBox() {
+    const nodes = findNativeStoreSearchNodes();
+    if (!nodes) return false;
+
+    const { compactGroup, antdSelect, nativeSelect } = nodes;
+    compactGroup.classList?.add('qsb-store-compact-wrap');
+    compactGroup.parentElement?.classList?.add('qsb-store-compact-parent');
+
+    if (!countBadge || !countBadge.isConnected) {
+      const existing = compactGroup.parentElement?.querySelector?.('.qsb-store-count-badge');
+      if (existing) {
+        countBadge = existing;
+      } else {
+        countBadge = document.createElement('span');
+        countBadge.className = 'qsb-count-badge qsb-store-count-badge';
+        if (compactGroup.insertAdjacentElement) {
+          compactGroup.insertAdjacentElement('afterend', countBadge);
+        } else if (compactGroup.parentElement) {
+          compactGroup.parentElement.appendChild(countBadge);
+        }
+      }
+    }
+
+    if (nativeSelect) {
+      for (const opt of STORE_CUSTOM_OPTIONS) {
+        const exists = Array.from(nativeSelect.children || []).some(el => el.value === opt.key);
+        if (!exists) {
+          const option = document.createElement('option');
+          option.value = opt.key;
+          option.textContent = opt.value;
+          option.setAttribute('data-qsb-store-opt', '1');
+          nativeSelect.appendChild(option);
+        }
+      }
+    }
+
+    if (antdSelect && !hasCustomAntdOptions(antdSelect)) {
+      if (capturedStoreOptionsArray) {
+        appendCustomStoreOptions(capturedStoreOptionsArray);
+      } else {
+        installStoreOptionsMapHook();
+      }
+      const ctrl = findStoreTableStateControl({ allowEmptyRecords: true });
+      if (ctrl && ctrl.tableData && typeof ctrl.tableData === 'object') {
+        const cloned = Array.isArray(ctrl.tableData) ? [...ctrl.tableData] : { ...ctrl.tableData };
+        if (ctrl.tableData === lastNativeStoreBizData) lastNativeStoreBizData = cloned;
+        if (ctrl.tableData === injectedStoreBizData) injectedStoreBizData = cloned;
+        ctrl.dispatch(cloned);
+      }
+    }
+
+    return true;
+  }
+
+  function onStoreDocumentClick(e) {
+    if (!isAccountStoreActive()) return;
+    const btn = e.target?.closest?.('button');
+    if (!btn) return;
+    if (btn.textContent.trim().replace(/\s+/g, '') !== '重置') return;
+    clearTimeout(storeSearchInputTimer);
+    clearTimeout(storeGuardTimer);
+    if (countBadge) countBadge.textContent = '';
+    storeSearchField = null;
+    activeStoreCustomTokens = [];
+    storeFilterPageNo = 1;
+    storeFilterPageSize = 20;
+    lastStoreReqQuery = null;
+    lastNativeStoreBizData = null;
+    injectedStoreBizData = null;
+    storeSearchRunId++;
+    clearStoreAllCache();
+    restoreStoreDomFallbackRows();
+  }
+
+  function onStoreFormInputOrChange(e) {
+    if (!isAccountStoreActive()) return;
+    const form = e.target?.closest?.('form');
+    if (!form) return;
+    const nodes = findNativeStoreSearchNodes();
+    if (!nodes || nodes.form !== form) return;
+    if (e.target !== nodes.input && e.target !== nodes.nativeSelect) return;
+
+    const st = getNativeStoreSearchState();
+    if (!st.customField) {
+      if (storeSearchField || activeStoreCustomTokens.length) {
+        storeSearchField = null;
+        activeStoreCustomTokens = [];
+        clearTimeout(storeSearchInputTimer);
+        clearTimeout(storeGuardTimer);
+        if (countBadge) countBadge.textContent = '';
+        restoreStoreDomFallbackRows();
+        setTimeout(() => { if (isAccountStoreActive()) syncStoreColumns(); }, 0);
+      }
+      return;
+    }
+
+    storeSearchField = st.customField;
+    storeFilterPageNo = 1;
+    clearTimeout(storeSearchInputTimer);
+    const capturedRaw = st.rawValue;
+    if (e.type === 'change' && e.target === nodes.nativeSelect) {
+      if (capturedRaw.trim()) applyStoreIdSearch(capturedRaw);
+      else if (activeStoreCustomTokens.length) applyStoreIdSearch('');
+      return;
+    }
+    storeSearchInputTimer = setTimeout(() => applyStoreIdSearch(capturedRaw), FILTER_DEBOUNCE_MS);
+  }
+
+  function onStoreWindowResize() {
+    if (isAccountStoreActive()) syncSplitTableColWidths(getMainTable());
+  }
+
+  function ensureStoreObserver() {
+    if (storeObserver) return;
+    const isRelevantMutation = m => {
+      const t = m.target;
+      if (t?.closest?.('.qsb-store-count-badge, [data-qsb-store-col]')) return false;
+      if (t?.classList?.contains('qsb-highlight') || t?.classList?.contains('qsb-store-count-badge')) return false;
+      if (t?.closest?.('.ant-table')) return true;
+      for (const n of m.addedNodes || []) {
+        if (n.nodeType !== 1 || isStoreColNode(n) || n.classList?.contains('qsb-highlight')) continue;
+        if (n.classList?.contains('ant-table-row') || n.classList?.contains('ant-table')
+          || n.querySelector?.('.ant-table-row') || n.tagName === 'TR' || n.tagName === 'TH') {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    storeObserver = new MutationObserver(mutations => {
+      if (!isAccountStoreActive() || isSelfModifyingDOM) return;
+      if (!mutations.some(isRelevantMutation)) return;
+      clearTimeout(storeSyncTimer);
+      storeSyncTimer = setTimeout(() => {
+        storeSyncTimer = null;
+        if (isAccountStoreActive()) syncStoreColumns();
+      }, 60);
+    });
+    storeObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function onStoreAccountRequest(body, url, reqContext) {
+    if (!url || !url.includes('/store-account/page')) return;
+    reqContext.isPage = true;
+    reqContext.isInternal = internalStoreFetchCount > 0;
+    const parsed = parseStoreRequestBody(body);
+    reqContext.parsedBody = parsed;
+    if (reqContext.isInternal || !isAccountStoreActive()) return;
+
+    lastStoreReqQuery = extractStoreBaseQuery(parsed);
+    if (parsed?.pageNo != null) storeFilterPageNo = Math.max(1, parseInt(parsed.pageNo, 10) || 1);
+    if (parsed?.pageSize != null) storeFilterPageSize = Math.max(1, parseInt(parsed.pageSize, 10) || 20);
+
+    const customKey = Object.keys(STORE_CUSTOM_KEY_TO_FIELD)
+      .find(k => Object.prototype.hasOwnProperty.call(parsed, k));
+    if (customKey) {
+      const rawVal = parsed[customKey] == null ? '' : String(parsed[customKey]);
+      const tokens = parseStoreSearchTokens(rawVal);
+      storeSearchField = STORE_CUSTOM_KEY_TO_FIELD[customKey];
+      activeStoreCustomTokens = tokens;
+      reqContext.isCustomIdSearch = tokens.length > 0;
+      reqContext.customRawValue = rawVal;
+    } else {
+      storeSearchField = null;
+      activeStoreCustomTokens = [];
+      reqContext.isCustomIdSearch = false;
+    }
+  }
+
+  function onStoreAccountResponse(data, url, reqContext) {
+    if (!url || !isAccountStoreActive()) return;
+    if (!data || String(data.code) !== '10000') return;
+    if (!url.includes('/store-account/page')) {
+      if (/\/store-account\/(add|update|delete|import)/.test(url)) {
+        clearStoreAllCache();
+      }
+      return;
+    }
+
+    const biz = data.bizData;
+    if (!biz || !Array.isArray(biz.records)) return;
+    cacheStoreRecords(biz.records);
+    if (reqContext?.isInternal) return;
+
+    if (reqContext?.isCustomIdSearch) {
+      const rawVal = reqContext.customRawValue ?? '';
+      clearTimeout(storeGuardTimer);
+      setTimeout(() => {
+        if (!isAccountStoreActive() || !activeStoreCustomTokens.length) return;
+        applyStoreIdSearch(rawVal);
+        storeGuardTimer = setTimeout(() => {
+          if (!isAccountStoreActive() || !activeStoreCustomTokens.length || !injectedStoreBizData) return;
+          const ctrl = findStoreTableStateControl();
+          if (ctrl && ctrl.tableData !== injectedStoreBizData) {
+            ctrl.dispatch(injectedStoreBizData);
+            setTimeout(() => { if (isAccountStoreActive()) syncStoreColumns(); }, 0);
+          }
+        }, 50);
+      }, 0);
+      return;
+    }
+
+    lastNativeStoreBizData = biz;
+    injectedStoreBizData = null;
+    if (countBadge) countBadge.textContent = '';
+    setTimeout(() => {
+      if (!isAccountStoreActive() || activeStoreCustomTokens.length) return;
+      restoreStoreDomFallbackRows();
+      syncStoreColumns();
+    }, 0);
+  }
+
+  onResponse('/store-account/', {
+    onRequest: onStoreAccountRequest,
+    onResponse: onStoreAccountResponse
+  });
+
+  registerPage({
+    name: 'accountStore',
+    route: ACCOUNT_STORE_ROUTE,
+    setup(state) {
+      const runId = ++state.runId;
+      state.loopRunning = true;
+      const finish = () => {
+        if (runId === state.runId) state.loopRunning = false;
+      };
+
+      ensureStoreObserver();
+      if (!storeClickBound) {
+        document.addEventListener('click', onStoreDocumentClick, true);
+        storeClickBound = true;
+      }
+      if (!storeFormBound) {
+        document.addEventListener('input', onStoreFormInputOrChange, true);
+        document.addEventListener('change', onStoreFormInputOrChange, true);
+        storeFormBound = true;
+      }
+      if (!storeResizeBound) {
+        window.addEventListener('resize', onStoreWindowResize, { passive: true });
+        storeResizeBound = true;
+      }
+
+      const ctrl = findStoreTableStateControl();
+      if (ctrl?.tableData && Array.isArray(ctrl.tableData.records)) {
+        cacheStoreRecords(ctrl.tableData.records);
+        if (!lastNativeStoreBizData) lastNativeStoreBizData = ctrl.tableData;
+      }
+      syncStoreColumns();
+
+      let retries = 0;
+      const tryInject = () => {
+        if (runId !== state.runId || !ACCOUNT_STORE_ROUTE.test(location.pathname)) { finish(); return; }
+        if (retries >= INJECT_MAX_RETRIES) {
+          console.warn(LOG_TAG, '超时：未找到店铺账号原生搜索框');
+          finish();
+          return;
+        }
+        if (extendNativeStoreSearchBox()) {
+          state.barInjected = true;
+          console.log(LOG_TAG, '店铺账号：已扩展原生搜索下拉（店铺ID/企业ID）');
+          finish();
+          syncStoreColumns();
+        } else {
+          retries++;
+          setTimeout(tryInject, INJECT_RETRY_MS);
+        }
+      };
+      tryInject();
+    },
+    teardown() {
+      storeSearchRunId++;
+      uninstallStoreOptionsMapHook();
+      clearStoreAllCache();
+      clearTimeout(storeSearchInputTimer);
+      storeSearchInputTimer = null;
+      clearTimeout(storeSyncTimer);
+      storeSyncTimer = null;
+      clearTimeout(storeGuardTimer);
+      storeGuardTimer = null;
+
+      if (storeObserver) {
+        storeObserver.disconnect();
+        storeObserver = null;
+      }
+      if (storeClickBound) {
+        document.removeEventListener('click', onStoreDocumentClick, true);
+        storeClickBound = false;
+      }
+      if (storeFormBound) {
+        document.removeEventListener('input', onStoreFormInputOrChange, true);
+        document.removeEventListener('change', onStoreFormInputOrChange, true);
+        storeFormBound = false;
+      }
+      if (storeResizeBound) {
+        window.removeEventListener('resize', onStoreWindowResize);
+        storeResizeBound = false;
+      }
+
+      if (Array.isArray(capturedStoreOptionsArray)) {
+        for (let i = capturedStoreOptionsArray.length - 1; i >= 0; i--) {
+          if (capturedStoreOptionsArray[i]?.__qsb) capturedStoreOptionsArray.splice(i, 1);
+        }
+        const ctrl = findStoreTableStateControl({ allowEmptyRecords: true });
+        if (ctrl && ctrl.tableData && typeof ctrl.tableData === 'object') {
+          ctrl.dispatch(Array.isArray(ctrl.tableData) ? [...ctrl.tableData] : { ...ctrl.tableData });
+        }
+      }
+      capturedStoreOptionsArray = null;
+
+      document.querySelectorAll('option[data-qsb-store-opt]').forEach(el => el.remove());
+      document.querySelectorAll('.qsb-store-count-badge').forEach(el => el.remove());
+      document.querySelectorAll('.qsb-store-compact-wrap').forEach(el => el.classList?.remove('qsb-store-compact-wrap'));
+      document.querySelectorAll('.qsb-store-compact-parent').forEach(el => el.classList?.remove('qsb-store-compact-parent'));
+
+      filterInput = null;
+      countBadge = null;
+      filterAnchorBtn = null;
+      storeSearchField = null;
+      activeStoreCustomTokens = [];
+      storeFilterPageNo = 1;
+      storeFilterPageSize = 20;
+      lastStoreReqQuery = null;
+      lastNativeStoreBizData = null;
+      injectedStoreBizData = null;
+      storeAccountById.clear();
+
+      restoreStoreDomFallbackRows();
+      removeStoreColumns(getMainTable());
     }
   });
 
