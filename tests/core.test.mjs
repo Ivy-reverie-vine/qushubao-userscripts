@@ -134,6 +134,7 @@ function createEnv({
 } = {}) {
   const logs = [];
   const timers = [];
+  const intervals = [];
   const fetchCalls = [];
   const bar = { value: null };
   const windowListeners = {};
@@ -306,7 +307,7 @@ function createEnv({
     AbortController: class { constructor() { this.signal = { aborted: false }; } abort() { this.signal.aborted = true; } },
     setTimeout: (fn, ms = 0) => { timers.push({ fn, due: clock + ms }); return timers.length; },
     clearTimeout: () => { },
-    setInterval: () => 0,
+    setInterval: (fn, ms = 0) => { intervals.push({ fn, ms }); return intervals.length; },
     addEventListener(type, fn) { (windowListeners[type] ||= []).push(fn); },
     removeEventListener(type, fn) {
       if (windowListeners[type]) {
@@ -357,6 +358,7 @@ function createEnv({
     run() { vm.runInContext(SRC, context); },
     flush,
     flushAsync,
+    runIntervals() { intervals.forEach(i => i.fn()); },
     push(url) { ctx.history.pushState({}, '', url); flush(); },
     fetch(...args) { return ctx.fetch(...args); },
   };
@@ -2047,4 +2049,127 @@ test('店铺账号管理：React SzTable Fiber 跨页精确分发 tableData 与�
 
   assert.equal(badge.textContent, '', '切回原生选项应隐藏检索计数角标');
   assert.equal(dispatched.length, 1, '切回原生选项后不该再以过滤态覆写原生列表');
+});
+
+test('店铺账号管理：watchRoute 轮询不重复激活，首屏早请求捕获，AntD 下拉切回原生还原表格', async () => {
+  const doc = createRichDom();
+  const { antdSelect, input } = makeStoreCompactForm(doc, { withAntdSelect: true });
+  const tbl = buildPlanTableInDoc(doc, {
+    headers: ['店铺名称', '平台', '操作'],
+    rows: [{ key: '1900000000000000301', cells: ['早请求店铺', '拼多多', '编辑'] }],
+  });
+
+  const initialTableData = {
+    current: 1,
+    size: 20,
+    total: 1,
+    pages: 1,
+    records: [
+      { id: '1900000000000000301', storeName: '早请求店铺', bizStoreId: 'EARLY_1', enterpriseId: 'ENT_1' },
+    ],
+  };
+  const dispatched = [];
+  const stateHook = {
+    memoizedState: initialTableData,
+    next: null,
+    queue: {
+      dispatch(next) {
+        dispatched.push(next);
+        stateHook.memoizedState = next;
+        szFiber.memoizedProps.tableData = next;
+      },
+    },
+  };
+  const ownerFiber = { memoizedState: stateHook, return: null };
+  const szFiber = {
+    memoizedProps: { tableData: initialTableData, onPageChange() {} },
+    return: ownerFiber,
+  };
+  tbl.wrapper.__reactFiber$test = { return: szFiber };
+  antdSelect.__reactFiber$test = { memoizedProps: { value: 'storeName' } };
+
+  const env = createEnv({
+    pathname: STORE_ROUTE,
+    customDocument: doc,
+    onFetch(url, body) {
+      if (!url.includes('/store-account/page')) return null;
+      assert.equal(body.accountType, 2, '应保留首屏 500ms 前捕获到的 accountType');
+      return {
+        code: '10000',
+        bizData: {
+          current: 1,
+          size: 500,
+          total: 2,
+          pages: 1,
+          records: [
+            { id: '1900000000000000301', storeName: '早请求店铺', bizStoreId: 'EARLY_1', enterpriseId: 'ENT_1' },
+            { id: '1900000000000000302', storeName: '二号店铺', bizStoreId: 'TARGET_2', enterpriseId: 'ENT_2' },
+          ],
+        },
+      };
+    },
+  });
+
+  // 1) 仅 run() 尚未 flush（模拟首屏 500ms 内 start() 还没跑时列表请求先到达）
+  env.run();
+  const earlyXhr = new env.FakeXHR();
+  earlyXhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/store-account/page');
+  earlyXhr.responseText = JSON.stringify({ code: '10000', bizData: initialTableData });
+  earlyXhr.send(JSON.stringify({ accountType: 2, pageNo: 1, pageSize: 20 }));
+  earlyXhr.fire('load');
+
+  await env.flushAsync();
+  dispatched.length = 0;
+
+  // 2) watchRoute 周期轮询多次，不得重复打印激活/扩展日志
+  const setupLogBefore = countLogs(env.logs, '已扩展原生搜索下拉');
+  env.runIntervals();
+  env.runIntervals();
+  env.runIntervals();
+  await env.flushAsync();
+  assert.equal(countLogs(env.logs, '已扩展原生搜索下拉'), setupLogBefore, 'watchRoute 轮询不得重复触发 setup');
+
+  // 3) AntD Select 切到「店铺ID」输入检索，再通过 AntD 下拉选项切回「店铺名称」
+  antdSelect.__reactFiber$test.memoizedProps.value = 'bizStoreId';
+  input.value = 'TARGET_2';
+  input.dispatchEvent({ type: 'input', target: input });
+  await env.flushAsync();
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].records[0].bizStoreId, 'TARGET_2');
+
+  const dropdown = doc.createElement('div');
+  dropdown.className = 'ant-select-dropdown';
+  const opt = doc.createElement('div');
+  opt.className = 'ant-select-item-option';
+  opt.textContent = '店铺名称';
+  dropdown.appendChild(opt);
+  doc.body.appendChild(dropdown);
+
+  antdSelect.__reactFiber$test.memoizedProps.value = 'storeName';
+  doc.dispatchDocEvent({ type: 'click', target: opt });
+  await env.flushAsync();
+
+  const badge = doc.querySelector('.qsb-store-count-badge');
+  assert.equal(badge.textContent, '', 'AntD 下拉切回原生后应清空角标');
+  assert.equal(dispatched.length, 2, '切回原生选项应把 lastNativeStoreBizData 还原给 SzTable');
+  assert.deepEqual(JSON.parse(JSON.stringify(dispatched[1])), initialTableData);
+});
+
+test('任务执行页：离开路由后到达的 /job/record/new 响应不再启动后台预加载', async () => {
+  const env = createEnv({ pathname: TARGET, withForm: true });
+  env.boot();
+
+  const xhr = new env.FakeXHR();
+  xhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/job/record/new');
+  xhr.responseText = JSON.stringify({
+    code: '10000',
+    bizData: { records: [{ jobUuid: '1900000000000000901', rpaStatus: 3, lastStartTime: '2026-11-16 10:00:00', lastEndTime: '2026-11-16 10:01:00' }] },
+  });
+  xhr.send(JSON.stringify({ dateTime: '2026-11-16' }));
+
+  env.push('/mallQuan/other');
+  xhr.fire('load');
+  await env.flushAsync();
+
+  assert.equal(env.fetchCalls.length, 0, '离开目标页后不应再发起 L2/L3/L4 预加载');
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.5.0
+// @version      1.5.1
 // @description  任务运行记录店铺筛选、异常外显与「机器人」自定义列 + 数据中心表字段导出 Excel（单表 / 连接器多 Sheet）与启用表名复制 + 店铺账号管理按店铺ID/企业ID搜索与列外显
 // @author       青藤
 // @icon         http://dep-cloud-fe-ops.ii-ai.tech/favicon.png
@@ -19,7 +19,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.5.0';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.5.1';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
   const ACCOUNT_STORE_ROUTE = /^\/mallQuan\/accountStoreManagement/;  // 店铺账号管理页路由
@@ -628,6 +628,7 @@
   let countBadge = null;
   let filterAnchorBtn = null;      // 同行的原生控件，垂直对齐的唯一可信基准
   let alignHooked = false;
+  let filterDebounceTimer = null;
 
   /** 顶栏 ant-form 里的"重置"按钮：既是注入位置，也是对齐全高/中心的基准 */
   function findAnchorButton() {
@@ -756,11 +757,13 @@
     scheduleAlign();
 
     // 监听输入（150ms 防抖）
-    let debounceTimer = null;
     filterInput.addEventListener('input', () => {
       clearBtn.style.display = filterInput.value ? 'block' : 'none';
-      clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => applyFilter(filterInput.value), FILTER_DEBOUNCE_MS);
+      clearTimeout(filterDebounceTimer);
+      filterDebounceTimer = setTimeout(() => {
+        filterDebounceTimer = null;
+        applyFilter(filterInput.value);
+      }, FILTER_DEBOUNCE_MS);
     });
 
     return true;
@@ -769,14 +772,14 @@
   /** 查找主表格（排除弹窗 ant-modal 内的详情表格）每行的店铺名称列索引 */
   let _storeColIdx = -1;
   function getMainTable() {
-    // 优先选择不在 modal 弹窗中的 table
+    // 只选择不在 modal/drawer 弹窗中的 table
     const tables = document.querySelectorAll('.ant-table');
     for (const tbl of tables) {
       if (!tbl.closest('.ant-modal') && !tbl.closest('.ant-drawer')) {
         return tbl;
       }
     }
-    return document.querySelector('.ant-table');
+    return null;
   }
 
   function findStoreColumnIndex() {
@@ -796,6 +799,7 @@
   }
 
   function applyFilter(keyword) {
+    if (!isTaskExecuteActive()) return;
     const mainTable = getMainTable();
     if (!mainTable) return;
 
@@ -989,11 +993,15 @@
   }
 
   function onListResponseReceived(data, url, reqContext) {
+    if (!TASK_EXECUTE_ROUTE.test(location.pathname)) return;
     if (!data || data.code !== '10000') return;
     const biz = data.bizData;
     if (!biz) return;
     const records = biz.records || [];
-    if (!Array.isArray(records) || !records.length) return;
+    if (!Array.isArray(records) || !records.length) {
+      resetPreloadState();
+      return;
+    }
 
     // 同步记录当前页日记录的 jobUuid -> planId 映射（保持字符串）
     recordDailyJobPlans(records);
@@ -1229,7 +1237,6 @@
 
     const text = `[1xxx: ${counts['1xxx']}个, 2xxx: ${counts['2xxx']}个, 3xxx: ${counts['3xxx']}个, unknown: ${counts['unknown']}个]`;
     finalize(jobUuid, text, allDetails, counts, dateTime, lastStartTime, lastEndTime);
-    updateRowVisualBar(jobUuid, dateTime);
   }
 
   function finalize(jobUuid, text, details, counts, dateTime, lastStartTime, lastEndTime) {
@@ -1652,16 +1659,17 @@
         btn.addEventListener('click', (e) => {
           e.stopPropagation();
           const raw = btn.getAttribute('data-raw');
-          if (navigator.clipboard && raw) {
-            navigator.clipboard.writeText(raw).then(() => {
-              btn.textContent = '✓ 已复制';
-              btn.classList.add('copied');
-              setTimeout(() => {
-                btn.textContent = '📋 复制';
-                btn.classList.remove('copied');
-              }, 1500);
-            });
-          }
+          if (!raw) return;
+          copyText(raw).then(ok => {
+            if (!ok || !btn.isConnected) return;
+            btn.textContent = '✓ 已复制';
+            btn.classList.add('copied');
+            setTimeout(() => {
+              if (!btn.isConnected) return;
+              btn.textContent = '📋 复制';
+              btn.classList.remove('copied');
+            }, 1500);
+          }).catch(() => { });
         });
       });
     }
@@ -1981,7 +1989,7 @@
 
   function xlsxCell(col, row, value, styleId) {
     const ref = colLetter(col) + row;
-    const text = value == null ? '' : String(value);
+    const text = (value == null ? '' : String(value)).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
     return `<c r="${ref}" t="inlineStr" s="${styleId}"><is><t xml:space="preserve">${esc(text)}</t></is></c>`;
   }
 
@@ -2160,11 +2168,16 @@
     setupPageChangeListeners();
   }
 
+  function isPageUiPresent(def, state) {
+    if (!def) return false;
+    return typeof def.isUiPresent === 'function' ? Boolean(def.isUiPresent(state)) : true;
+  }
+
   function enterPage(def) {
     ensureInterceptor();
 
     // 同一页面且 UI 还在（仅 query 变化、分页、keep-alive 回退），不重复激活
-    if (activePage && activePage.def === def && document.querySelector('.qsb-filter-bar')) return;
+    if (activePage && activePage.def === def && isPageUiPresent(def, activePage.state)) return;
 
     if (!activePage) {
       activePage = { def, state: { runId: 0, barInjected: false, loopRunning: false } };
@@ -2216,9 +2229,10 @@
       // 同一路径下页面被整体重渲染（容器销毁重建）时补注入；
       // 只在曾经注入成功过才补，避免表单结构变化时无限重试刷屏
       const state = activePage?.state;
-      if (state && state.barInjected && !state.loopRunning && !document.querySelector('.qsb-filter-bar')) {
+      const def = activePage?.def;
+      if (state && state.barInjected && !state.loopRunning && !isPageUiPresent(def, state)) {
         state.barInjected = false;
-        enterPage(activePage.def);
+        enterPage(def);
       }
     }, ROUTE_POLL_MS);
   }
@@ -3071,6 +3085,7 @@
   registerPage({
     name: 'taskExecute',
     route: TASK_EXECUTE_ROUTE,
+    isUiPresent: () => Boolean(document.querySelector('.qsb-filter-bar')),
     setup(state) {
       const runId = ++state.runId;
       state.loopRunning = true;
@@ -3128,6 +3143,8 @@
       removeBotColumn(getMainTable());
 
       // 4. 清理延迟绑定与防抖定时器，杜绝离开页面后的异步 DOM 操作
+      clearTimeout(filterDebounceTimer);
+      filterDebounceTimer = null;
       clearTimeout(_attachDebounce);
       _attachDebounce = null;
       clearTimeout(postListBindTimer);
@@ -3280,7 +3297,13 @@
     if (!connectorId) return Promise.resolve([]);
     if (!tableDefCache.has(connectorId)) {
       const pending = apiPost('/conn/mapper/get', { connectorId })
-        .then(res => (res && String(res.code) === '10000' && Array.isArray(res.bizData)) ? res.bizData : [])
+        .then(res => {
+          if (!res || String(res.code) !== '10000' || !Array.isArray(res.bizData)) {
+            tableDefCache.delete(connectorId);
+            return [];
+          }
+          return res.bizData;
+        })
         .catch(err => { tableDefCache.delete(connectorId); throw err; });
       tableDefCache.set(connectorId, pending);
     }
@@ -3570,7 +3593,7 @@
     const owner = table ? findOwnerRow(table) : { id: '', name: '' };
     const rows = table ? enabledTableRows(table) : [];
     if (!rows.length) {
-      flashExportAll(link, '无启用表');
+      flashExportAll(link, '无启用表', false, 2000);
       return;
     }
 
@@ -3642,6 +3665,7 @@
   registerPage({
     name: 'dataCenter',
     route: DATA_CENTER_ROUTE,
+    isUiPresent: state => Boolean(state?.exportReady),
     setup(state) {
       // enterPage 在同一路由内会被重复调用，这里必须幂等
       if (!state.exportReady) {
@@ -3701,6 +3725,7 @@
   };
 
   const storeAccountById = new Map();
+  let storeCountBadge = null;
   let storeSearchField = null;
   let activeStoreCustomTokens = [];
   let storeSearchInputTimer = null;
@@ -4184,10 +4209,15 @@
 
       mainTable.querySelectorAll('.ant-table-tbody tr.ant-table-placeholder td').forEach(td => {
         if (!(td.colSpan > 0)) return;
+        const orig = td.hasAttribute('data-qsb-orig-colspan')
+          ? parseInt(td.getAttribute('data-qsb-orig-colspan'), 10)
+          : td.colSpan;
+        if (!Number.isFinite(orig)) return;
         if (!td.hasAttribute('data-qsb-orig-colspan')) {
-          td.setAttribute('data-qsb-orig-colspan', String(td.colSpan));
-          td.colSpan += STORE_EXTRA_COLS.length;
+          td.setAttribute('data-qsb-orig-colspan', String(orig));
         }
+        const targetSpan = orig + STORE_EXTRA_COLS.length;
+        if (td.colSpan !== targetSpan) td.colSpan = targetSpan;
       });
 
       syncSplitTableColWidths(mainTable);
@@ -4291,8 +4321,8 @@
           if (row.style.display !== 'none') row.style.display = 'none';
         }
       });
-      if (countBadge) {
-        countBadge.textContent = tokens.length ? `匹配 ${visible} / ${rows.length} 条` : '';
+      if (storeCountBadge) {
+        storeCountBadge.textContent = tokens.length ? `匹配 ${visible} / ${rows.length} 条` : '';
       }
     } finally {
       setTimeout(() => { isSelfModifyingDOM = false; }, 0);
@@ -4322,8 +4352,8 @@
 
     injectedStoreBizData = nextBizData;
     ctrl.dispatch(nextBizData);
-    if (countBadge) {
-      countBadge.textContent = matched.length
+    if (storeCountBadge) {
+      storeCountBadge.textContent = matched.length
         ? `匹配 ${matched.length} / ${allRecords.length} 条`
         : `未找到匹配 (共 ${allRecords.length} 条)`;
     }
@@ -4332,33 +4362,49 @@
     }, 0);
   }
 
+  function restoreStoreViewToNative() {
+    if (storeSearchAbort) {
+      storeSearchAbort.abort();
+      storeSearchAbort = null;
+    }
+    clearTimeout(storeGuardTimer);
+    storeGuardTimer = null;
+    if (storeCountBadge) storeCountBadge.textContent = '';
+
+    const ctrl = findStoreTableStateControl();
+    if (ctrl && lastNativeStoreBizData && (injectedStoreBizData || ctrl.tableData === injectedStoreBizData)) {
+      injectedStoreBizData = null;
+      ctrl.dispatch(lastNativeStoreBizData);
+      setTimeout(() => {
+        if (isAccountStoreActive()) syncStoreColumns();
+      }, 0);
+      return;
+    }
+    injectedStoreBizData = null;
+    applyStoreDomFallbackFilter([], storeSearchField || 'all');
+    syncStoreColumns();
+  }
+
+  function clearStoreCustomSearchState() {
+    if (!storeSearchField && !activeStoreCustomTokens.length && !injectedStoreBizData) return;
+    storeSearchField = null;
+    activeStoreCustomTokens = [];
+    clearTimeout(storeSearchInputTimer);
+    storeSearchInputTimer = null;
+    restoreStoreViewToNative();
+  }
+
   async function applyStoreIdSearch(rawOverride) {
     if (!isAccountStoreActive()) return;
     const nativeState = getNativeStoreSearchState();
-    const field = storeSearchField || nativeState.customField;
+    const field = nativeState.key ? nativeState.customField : (storeSearchField || nativeState.customField);
     const rawVal = rawOverride !== undefined ? String(rawOverride) : nativeState.rawValue;
     const tokens = field ? parseStoreSearchTokens(rawVal) : [];
     activeStoreCustomTokens = tokens;
     const runId = ++storeSearchRunId;
 
     if (!field || !tokens.length) {
-      if (storeSearchAbort) {
-        storeSearchAbort.abort();
-        storeSearchAbort = null;
-      }
-      clearTimeout(storeGuardTimer);
-      if (countBadge) countBadge.textContent = '';
-      const ctrl = findStoreTableStateControl();
-      if (ctrl && lastNativeStoreBizData) {
-        injectedStoreBizData = null;
-        ctrl.dispatch(lastNativeStoreBizData);
-        setTimeout(() => {
-          if (isAccountStoreActive()) syncStoreColumns();
-        }, 0);
-      } else {
-        applyStoreDomFallbackFilter([], field || 'all');
-        syncStoreColumns();
-      }
+      restoreStoreViewToNative();
       return;
     }
 
@@ -4377,7 +4423,7 @@
       return;
     }
 
-    if (countBadge) countBadge.textContent = '全量检索中...';
+    if (storeCountBadge) storeCountBadge.textContent = '全量检索中...';
 
     let fetchPromise;
     if (storeAllCache.key === baseKey && storeAllCache.promise) {
@@ -4387,8 +4433,8 @@
       storeSearchAbort = new AbortController();
       const signal = storeSearchAbort.signal;
       fetchPromise = fetchAllStoreAccounts(baseQuery, signal, (cur, pages) => {
-        if (runId !== storeSearchRunId || !isAccountStoreActive() || !countBadge) return;
-        countBadge.textContent = pages > 1 ? `全量检索中 (${cur}/${pages})...` : '全量检索中...';
+        if (runId !== storeSearchRunId || !isAccountStoreActive() || !storeCountBadge) return;
+        storeCountBadge.textContent = pages > 1 ? `全量检索中 (${cur}/${pages})...` : '全量检索中...';
       });
       storeAllCache = { key: baseKey, promise: fetchPromise, records: null, total: 0 };
     }
@@ -4404,8 +4450,8 @@
     } catch (err) {
       if (err?.name === 'AbortError') return;
       if (storeAllCache.key === baseKey) storeAllCache = { key: '', promise: null, records: null, total: 0 };
-      if (runId === storeSearchRunId && isAccountStoreActive() && countBadge) {
-        countBadge.textContent = '检索失败';
+      if (runId === storeSearchRunId && isAccountStoreActive() && storeCountBadge) {
+        storeCountBadge.textContent = '检索失败';
       }
       console.warn(LOG_TAG, '店铺账号全量检索失败:', err?.message || err);
     }
@@ -4420,17 +4466,17 @@
     compactGroup.classList?.add('qsb-store-compact-wrap');
     compactGroup.parentElement?.classList?.add('qsb-store-compact-parent');
 
-    if (!countBadge || !countBadge.isConnected) {
+    if (!storeCountBadge || !storeCountBadge.isConnected) {
       const existing = compactGroup.parentElement?.querySelector?.('.qsb-store-count-badge');
       if (existing) {
-        countBadge = existing;
+        storeCountBadge = existing;
       } else {
-        countBadge = document.createElement('span');
-        countBadge.className = 'qsb-count-badge qsb-store-count-badge';
+        storeCountBadge = document.createElement('span');
+        storeCountBadge.className = 'qsb-count-badge qsb-store-count-badge';
         if (compactGroup.insertAdjacentElement) {
-          compactGroup.insertAdjacentElement('afterend', countBadge);
+          compactGroup.insertAdjacentElement('afterend', storeCountBadge);
         } else if (compactGroup.parentElement) {
-          compactGroup.parentElement.appendChild(countBadge);
+          compactGroup.parentElement.appendChild(storeCountBadge);
         }
       }
     }
@@ -4466,14 +4512,36 @@
     return true;
   }
 
+  function syncStoreSelectModeChange() {
+    const st = getNativeStoreSearchState();
+    if (!st.nodes) return;
+    if (!st.customField) {
+      clearStoreCustomSearchState();
+      return;
+    }
+    if (st.customField !== storeSearchField) {
+      storeSearchField = st.customField;
+      storeFilterPageNo = 1;
+      clearTimeout(storeSearchInputTimer);
+      if (st.rawValue.trim()) applyStoreIdSearch(st.rawValue);
+      else if (activeStoreCustomTokens.length) applyStoreIdSearch('');
+    }
+  }
+
   function onStoreDocumentClick(e) {
     if (!isAccountStoreActive()) return;
+    if (e.target?.closest?.('.ant-select-dropdown .ant-select-item-option')) {
+      setTimeout(() => {
+        if (isAccountStoreActive()) syncStoreSelectModeChange();
+      }, 0);
+      return;
+    }
     const btn = e.target?.closest?.('button');
     if (!btn) return;
     if (btn.textContent.trim().replace(/\s+/g, '') !== '重置') return;
     clearTimeout(storeSearchInputTimer);
     clearTimeout(storeGuardTimer);
-    if (countBadge) countBadge.textContent = '';
+    if (storeCountBadge) storeCountBadge.textContent = '';
     storeSearchField = null;
     activeStoreCustomTokens = [];
     storeFilterPageNo = 1;
@@ -4496,15 +4564,7 @@
 
     const st = getNativeStoreSearchState();
     if (!st.customField) {
-      if (storeSearchField || activeStoreCustomTokens.length) {
-        storeSearchField = null;
-        activeStoreCustomTokens = [];
-        clearTimeout(storeSearchInputTimer);
-        clearTimeout(storeGuardTimer);
-        if (countBadge) countBadge.textContent = '';
-        restoreStoreDomFallbackRows();
-        setTimeout(() => { if (isAccountStoreActive()) syncStoreColumns(); }, 0);
-      }
+      clearStoreCustomSearchState();
       return;
     }
 
@@ -4553,13 +4613,17 @@
     storeObserver.observe(document.body, { childList: true, subtree: true });
   }
 
+  function isStoreRouteOrActive() {
+    return isAccountStoreActive() || ACCOUNT_STORE_ROUTE.test(location.pathname);
+  }
+
   function onStoreAccountRequest(body, url, reqContext) {
     if (!url || !url.includes('/store-account/page')) return;
     reqContext.isPage = true;
     reqContext.isInternal = internalStoreFetchCount > 0;
     const parsed = parseStoreRequestBody(body);
     reqContext.parsedBody = parsed;
-    if (reqContext.isInternal || !isAccountStoreActive()) return;
+    if (reqContext.isInternal || !isStoreRouteOrActive()) return;
 
     lastStoreReqQuery = extractStoreBaseQuery(parsed);
     if (parsed?.pageNo != null) storeFilterPageNo = Math.max(1, parseInt(parsed.pageNo, 10) || 1);
@@ -4582,7 +4646,7 @@
   }
 
   function onStoreAccountResponse(data, url, reqContext) {
-    if (!url || !isAccountStoreActive()) return;
+    if (!url || !isStoreRouteOrActive()) return;
     if (!data || String(data.code) !== '10000') return;
     if (!url.includes('/store-account/page')) {
       if (/\/store-account\/(add|update|delete|import)/.test(url)) {
@@ -4616,7 +4680,7 @@
 
     lastNativeStoreBizData = biz;
     injectedStoreBizData = null;
-    if (countBadge) countBadge.textContent = '';
+    if (storeCountBadge) storeCountBadge.textContent = '';
     setTimeout(() => {
       if (!isAccountStoreActive() || activeStoreCustomTokens.length) return;
       restoreStoreDomFallbackRows();
@@ -4632,6 +4696,7 @@
   registerPage({
     name: 'accountStore',
     route: ACCOUNT_STORE_ROUTE,
+    isUiPresent: () => Boolean(document.querySelector('.qsb-store-count-badge')),
     setup(state) {
       const runId = ++state.runId;
       state.loopRunning = true;
@@ -4726,9 +4791,7 @@
       document.querySelectorAll('.qsb-store-compact-wrap').forEach(el => el.classList?.remove('qsb-store-compact-wrap'));
       document.querySelectorAll('.qsb-store-compact-parent').forEach(el => el.classList?.remove('qsb-store-compact-parent'));
 
-      filterInput = null;
-      countBadge = null;
-      filterAnchorBtn = null;
+      storeCountBadge = null;
       storeSearchField = null;
       activeStoreCustomTokens = [];
       storeFilterPageNo = 1;
