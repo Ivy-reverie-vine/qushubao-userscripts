@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.5.1
+// @version      1.5.2
 // @description  任务运行记录店铺筛选、异常外显与「机器人」自定义列 + 数据中心表字段导出 Excel（单表 / 连接器多 Sheet）与启用表名复制 + 店铺账号管理按店铺ID/企业ID搜索与列外显
 // @author       青藤
 // @icon         http://dep-cloud-fe-ops.ii-ai.tech/favicon.png
@@ -19,7 +19,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.5.1';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.5.2';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
   const ACCOUNT_STORE_ROUTE = /^\/mallQuan\/accountStoreManagement/;  // 店铺账号管理页路由
@@ -4095,6 +4095,17 @@
     }
   }
 
+  function withStoreSelfMutation(fn) {
+    const prev = isSelfModifyingDOM;
+    isSelfModifyingDOM = true;
+    try {
+      fn();
+    } finally {
+      storeObserver?.takeRecords?.();
+      isSelfModifyingDOM = prev;
+    }
+  }
+
   function removeStoreColumns(mainTable) {
     if (!mainTable) return;
     const nodes = mainTable.querySelectorAll('[data-qsb-store-col]');
@@ -4103,8 +4114,7 @@
     const origCols = mainTable.querySelectorAll('col[data-qsb-orig-width]');
     if (!nodes.length && !placeholders.length && !origCols.length) return;
 
-    isSelfModifyingDOM = true;
-    try {
+    withStoreSelfMutation(() => {
       nodes.forEach(el => el.remove());
       placeholders.forEach(td => {
         const orig = parseInt(td.getAttribute('data-qsb-orig-colspan'), 10);
@@ -4122,9 +4132,7 @@
         headerTable.style.width = headerTable.dataset.qsbOrigWidth;
         delete headerTable.dataset.qsbOrigWidth;
       }
-    } finally {
-      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
-    }
+    });
   }
 
   /** 在主表格「店铺名称」列后注入「店铺ID」「企业ID」列并刷新数值与关键词高亮 */
@@ -4149,8 +4157,7 @@
     const tokens = highlightField ? activeStoreCustomTokens : [];
     const tokenPairs = tokens.map(raw => ({ raw, lower: raw.toLowerCase() }));
 
-    isSelfModifyingDOM = true;
-    try {
+    withStoreSelfMutation(() => {
       mainTable.querySelectorAll('colgroup').forEach(colgroup => {
         const nativeCols = Array.from(colgroup.children || []).filter(c => !isStoreColNode(c));
         if (nativeCols.length < insertIdx) return;
@@ -4221,9 +4228,7 @@
       });
 
       syncSplitTableColWidths(mainTable);
-    } finally {
-      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
-    }
+    });
   }
 
   /** 分页拉取当前原生筛选条件下的全量店铺账号记录，遵循 ≥200ms 请求间隔 */
@@ -4287,14 +4292,11 @@
   function restoreStoreDomFallbackRows() {
     const mainTable = getMainTable();
     if (!mainTable) return;
-    isSelfModifyingDOM = true;
-    try {
+    withStoreSelfMutation(() => {
       mainTable.querySelectorAll('.ant-table-tbody tr.ant-table-row').forEach(row => {
         if (row.style.display !== '') row.style.display = '';
       });
-    } finally {
-      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
-    }
+    });
   }
 
   function applyStoreDomFallbackFilter(tokens, field) {
@@ -4303,8 +4305,7 @@
     const rows = mainTable.querySelectorAll('.ant-table-tbody tr.ant-table-row');
     let visible = 0;
 
-    isSelfModifyingDOM = true;
-    try {
+    withStoreSelfMutation(() => {
       rows.forEach(row => {
         const key = row.getAttribute('data-row-key');
         const rec = (key && storeAccountById.get(key)) || extractStoreRecordFromRow(row);
@@ -4324,9 +4325,7 @@
       if (storeCountBadge) {
         storeCountBadge.textContent = tokens.length ? `匹配 ${visible} / ${rows.length} 条` : '';
       }
-    } finally {
-      setTimeout(() => { isSelfModifyingDOM = false; }, 0);
-    }
+    });
   }
 
   function renderFilteredStoreRecords(allRecords, tokens, field) {

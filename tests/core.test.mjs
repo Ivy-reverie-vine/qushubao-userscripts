@@ -234,6 +234,7 @@ function createEnv({
     constructor(cb) {
       this.cb = cb;
       this.connected = false;
+      this.takeRecordsCalls = 0;
       observerInstances.push(this);
     }
     observe(target, options) {
@@ -243,6 +244,10 @@ function createEnv({
     }
     disconnect() {
       this.connected = false;
+    }
+    takeRecords() {
+      this.takeRecordsCalls++;
+      return [];
     }
   }
 
@@ -2172,4 +2177,71 @@ test('任务执行页：离开路由后到达的 /job/record/new 响应不再启
   await env.flushAsync();
 
   assert.equal(env.fetchCalls.length, 0, '离开目标页后不应再发起 L2/L3/L4 预加载');
+});
+
+test('店铺账号管理：翻页响应先于 React commit 触发 syncStoreColumns 时，storeObserver 不得被吞导致新行错位', async () => {
+  const doc = createRichDom();
+  makeStoreCompactForm(doc);
+  const tbl = buildPlanTableInDoc(doc, {
+    headers: ['店铺名称', '平台类型', '操作'],
+    rows: [
+      { key: '1900000000000000401', cells: ['第一页店铺', '京东', '查看'] },
+    ],
+  });
+
+  const env = createEnv({ pathname: STORE_ROUTE, customDocument: doc });
+  env.boot();
+  await env.flushAsync();
+
+  const storeObs = env.observerInstances.find(o => o.connected && o.target === doc.body);
+  assert.ok(storeObs, '应已挂载店铺管理页 MutationObserver');
+
+  // 模拟翻页：/store-account/page 返回第 2 页数据
+  const xhr = new env.FakeXHR();
+  xhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/store-account/page');
+  xhr.responseText = JSON.stringify({
+    code: '10000',
+    bizData: {
+      current: 2,
+      size: 20,
+      total: 40,
+      pages: 2,
+      records: [
+        { id: '1900000000000000402', storeName: '第二页店铺', bizStoreId: 'S_PAGE2', enterpriseId: 'E_PAGE2' },
+      ],
+    },
+  });
+  xhr.send(JSON.stringify({ accountType: 1, pageNo: 2, pageSize: 20 }));
+  xhr.fire('load');
+
+  // 仅步进执行 onStoreAccountResponse 排入的第一个 setTimeout(0)（内部执行 restore + syncStoreColumns）
+  // 此时如果仍依赖 setTimeout(..., 0) 解锁 isSelfModifyingDOM，锁仍为 true
+  env.flush(1);
+
+  // 紧接着在解锁 timer 之前，模拟 React Scheduler (MessageChannel) 先行 commit：替换 tbody 数据行
+  const oldRow = tbl.tbody.querySelector('tr.ant-table-row');
+  oldRow.remove();
+  const newRow = doc.createElement('tr');
+  newRow.className = 'ant-table-row ant-table-row-level-0';
+  newRow.setAttribute('data-row-key', '1900000000000000402');
+  for (const txt of ['第二页店铺', '抖音', '查看']) {
+    const td = doc.createElement('td');
+    td.className = 'ant-table-cell';
+    td.textContent = txt;
+    newRow.appendChild(td);
+  }
+  tbl.tbody.appendChild(newRow);
+
+  // 浏览器在当前宏任务末尾微任务阶段派发 storeObserver
+  storeObs.cb([{ target: tbl.tbody, addedNodes: [newRow], removedNodes: [oldRow] }]);
+
+  // 跑完剩余定时任务（包括 60ms 防抖）
+  await env.flushAsync();
+
+  assert.equal(newRow.children.length, 5, '翻页后的新行必须补齐「店铺ID」「企业ID」两列，不得左移错位');
+  assert.equal(newRow.children[1].getAttribute('data-qsb-store-col'), 'bizStoreId');
+  assert.equal(newRow.children[1].textContent, 'S_PAGE2');
+  assert.equal(newRow.children[2].getAttribute('data-qsb-store-col'), 'enterpriseId');
+  assert.equal(newRow.children[2].textContent, 'E_PAGE2');
+  assert.ok(storeObs.takeRecordsCalls > 0, '同步修改 DOM 结束时应通过 takeRecords() 排空自身记录');
 });
