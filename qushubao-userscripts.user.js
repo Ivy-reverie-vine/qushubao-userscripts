@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         取数宝后台助手
 // @namespace    https://dep.ai-indeed.com/qushubao-userscripts
-// @version      1.5.2
+// @version      1.5.3
 // @description  任务运行记录店铺筛选、异常外显与「机器人」自定义列 + 数据中心表字段导出 Excel（单表 / 连接器多 Sheet）与启用表名复制 + 店铺账号管理按店铺ID/企业ID搜索与列外显
 // @author       青藤
 // @icon         http://dep-cloud-fe-ops.ii-ai.tech/favicon.png
@@ -19,7 +19,7 @@
   // 常量与配置
   // ═══════════════════════════════════════════════════════════════
   const LOG_TAG = '[qushubao-userscripts.user.js]';  // 控制台统一前缀，与脚本文件名一致
-  const VERSION = 'v1.5.2';            // 与头部 @version 保持一致，发版时同步修改
+  const VERSION = 'v1.5.3';            // 与头部 @version 保持一致，发版时同步修改
   const TASK_EXECUTE_ROUTE = /^\/mallQuan\/taskExecuteManagementV2/;  // 任务执行页路由，按此激活对应页面模块
   const DATA_CENTER_ROUTE = /^\/mallQuan\/dataCenter/;                // 数据中心页路由
   const ACCOUNT_STORE_ROUTE = /^\/mallQuan\/accountStoreManagement/;  // 店铺账号管理页路由
@@ -2249,6 +2249,7 @@
   const BOT_COL_LABEL = '机器人';
   const BOT_COL_WIDTH = 110;
   const SCHEDULE_PAGE_SIZE = 100;
+  const SCHEDULE_SEARCH_MAX_PAGES = 5;
   const DEFAULT_BOT_ANCHOR = { key: 'storeName', side: 'after', label: '店铺' };
   // 线上 taskExecuteManagementV2 真实 data-rbd-draggable-id 键名：
   // planName / storeName / startTime（弹窗文案「最后运行开始时间」，表头「最近运行开始时间」）/
@@ -2273,12 +2274,18 @@
   const planBotById = new Map();        // planId(string) -> botName
   const planBotByJobUuid = new Map();   // jobUuid(string) -> botName
   const jobPlanMap = new Map();         // jobUuid(string) -> planId(string)
+  const jobRecordMeta = new Map();      // jobUuid(string) -> { planId, jobName, jobType }
+  const searchedBotKeywords = new Set(); // 已查询或排队中的非日常搜索键 `${jobType}\0${jobName}`
+  const botFallbackQueue = [];          // [{ searchKey, jobName, jobType, planId, jobUuid }]
   const observedFieldMeta = new Map();  // data-rbd-draggable-id -> label
   let observedFieldOrder = [];          // [{ key, label }]
   let botColConfig = loadBotColConfig();
   let botMapLoaded = false;
   let botMapPromise = null;
   let botMapAbort = null;
+  let botFallbackWorkerRunning = false;
+  let botFallbackAbort = null;
+  let botFallbackActiveTask = null;
   let fieldSettingObserver = null;
   let fieldSettingSyncTimer = null;
   let botDragState = null;
@@ -2332,15 +2339,33 @@
 
   function recordDailyJobPlans(records) {
     for (const r of records) {
-      if (!r || r.jobUuid == null || r.planId == null) continue;
+      if (!r || r.jobUuid == null) continue;
       const ju = String(r.jobUuid).trim();
-      const pid = String(r.planId).trim();
-      if (ju && pid) jobPlanMap.set(ju, pid);
+      if (!ju) continue;
+      const pid = r.planId != null ? String(r.planId).trim() : '';
+      const jobName = String(r.jobName ?? r.planName ?? '').trim();
+      const jobType = r.jobType != null && String(r.jobType).trim() !== '' ? String(r.jobType).trim() : '';
+      if (pid) jobPlanMap.set(ju, pid);
+      const prev = jobRecordMeta.get(ju);
+      jobRecordMeta.set(ju, {
+        planId: pid || prev?.planId || '',
+        jobName: jobName || prev?.jobName || '',
+        jobType: jobType || prev?.jobType || ''
+      });
     }
   }
 
-  function extractPlanIdFromRow(row) {
-    if (!row) return null;
+  function extractRowRecordFromFramework(row) {
+    const empty = { planId: '', jobName: '', jobType: '' };
+    if (!row) return empty;
+    const pick = rec => {
+      if (!rec || typeof rec !== 'object') return null;
+      const planId = rec.planId != null ? String(rec.planId).trim() : '';
+      const jobName = String(rec.jobName ?? rec.planName ?? '').trim();
+      const jobType = rec.jobType != null && String(rec.jobType).trim() !== '' ? String(rec.jobType).trim() : '';
+      if (!planId && !jobName && !jobType) return null;
+      return { planId, jobName, jobType };
+    };
     try {
       const fiberKey = Object.keys(row).find(k =>
         k.startsWith('__reactInternalInstance') || k.startsWith('__reactFiber'));
@@ -2348,7 +2373,8 @@
         let fiber = row[fiberKey];
         for (let depth = 0; fiber && depth < 20; depth++) {
           const props = fiber.memoizedProps || fiber.pendingProps;
-          if (props?.record?.planId != null) return String(props.record.planId).trim();
+          const got = pick(props?.record);
+          if (got) return got;
           fiber = fiber.return;
         }
       }
@@ -2357,32 +2383,58 @@
       const vueKey = Object.keys(row).find(k => k.startsWith('__vue'));
       if (vueKey) {
         const vm = row[vueKey];
-        const rec = vm?.record || vm?.$props?.record || vm?.ctx?.record;
-        if (rec?.planId != null) return String(rec.planId).trim();
+        const got = pick(vm?.record || vm?.$props?.record || vm?.ctx?.record);
+        if (got) return got;
       }
     } catch (_) { }
-    return null;
+    return empty;
   }
 
-  function resolveRowBotName(row) {
-    const jobUuid = extractJobUuid(row);
-    const planId = (jobUuid && jobPlanMap.get(jobUuid)) || extractPlanIdFromRow(row);
-    if (planId && planBotById.has(planId)) {
-      return planBotById.get(planId) || '-';
+  function extractRowPlanNameFromDom(row, planNameColIdx) {
+    if (!row || planNameColIdx < 0) return '';
+    const nativeCells = Array.from(row.children || []).filter(el => !isBotColNode(el));
+    const cell = nativeCells[planNameColIdx];
+    return cell ? normalizeColText(cell.textContent) : '';
+  }
+
+  function extractRowRecordMeta(row, planNameColIdx = -1) {
+    const jobUuid = extractJobUuid(row) || '';
+    const cached = jobUuid ? jobRecordMeta.get(jobUuid) : null;
+    const fw = extractRowRecordFromFramework(row);
+    const planId = (jobUuid && jobPlanMap.get(jobUuid)) || cached?.planId || fw.planId || '';
+    const jobType = cached?.jobType || fw.jobType || '';
+    const jobName = cached?.jobName || fw.jobName || extractRowPlanNameFromDom(row, planNameColIdx) || '';
+    return { jobUuid, planId, jobName, jobType };
+  }
+
+  function hasBotMapping(planId, jobUuid) {
+    return Boolean((planId && planBotById.has(planId)) || (jobUuid && planBotByJobUuid.has(jobUuid)));
+  }
+
+  function resolveRowBotName(row, meta) {
+    const info = meta || extractRowRecordMeta(row);
+    if (info.planId && planBotById.has(info.planId)) {
+      return planBotById.get(info.planId) || '-';
     }
-    if (jobUuid && planBotByJobUuid.has(jobUuid)) {
-      return planBotByJobUuid.get(jobUuid) || '-';
+    if (info.jobUuid && planBotByJobUuid.has(info.jobUuid)) {
+      return planBotByJobUuid.get(info.jobUuid) || '-';
     }
     return '-';
   }
 
-  async function fetchAllSchedulePlans(signal) {
+  async function fetchSchedulePlans({
+    jobType = '1',
+    jobName = '',
+    signal = undefined,
+    maxPages = Infinity,
+    stopOnMatch = null
+  } = {}) {
     let pageNo = 1;
     let totalPages = 1;
     const byId = new Map();
     const byJobUuid = new Map();
 
-    while (pageNo <= totalPages) {
+    while (pageNo <= totalPages && pageNo <= maxPages) {
       if (signal?.aborted) return null;
       if (pageNo > 1) {
         await sleep(REQUEST_INTERVAL_MS);
@@ -2392,8 +2444,8 @@
       const res = await apiPost('/schedule/page', {
         pageSize: SCHEDULE_PAGE_SIZE,
         pageNo,
-        jobName: '',
-        jobType: '',
+        jobName,
+        jobType,
         industryProducts: ['1']
       }, signal);
 
@@ -2414,6 +2466,12 @@
         }
       }
 
+      if (stopOnMatch) {
+        const hitPlan = stopOnMatch.planId && byId.has(stopOnMatch.planId);
+        const hitJob = stopOnMatch.jobUuid && byJobUuid.has(stopOnMatch.jobUuid);
+        if (hitPlan || hitJob) break;
+      }
+
       const pagesNum = parseInt(biz.pages, 10);
       if (Number.isFinite(pagesNum) && pagesNum >= 1) {
         totalPages = pagesNum;
@@ -2430,20 +2488,142 @@
     return { byId, byJobUuid };
   }
 
+  function mergeBotMapping(result) {
+    if (!result) return false;
+    let updated = false;
+    result.byId.forEach((v, k) => {
+      if (planBotById.get(k) !== v || !planBotById.has(k)) updated = true;
+      planBotById.set(k, v);
+    });
+    result.byJobUuid.forEach((v, k) => {
+      if (planBotByJobUuid.get(k) !== v || !planBotByJobUuid.has(k)) updated = true;
+      planBotByJobUuid.set(k, v);
+    });
+    return updated;
+  }
+
+  function pauseBotFallbackWorker() {
+    if (botFallbackActiveTask) {
+      searchedBotKeywords.delete(botFallbackActiveTask.searchKey);
+      botFallbackActiveTask = null;
+    }
+    while (botFallbackQueue.length > 0) {
+      const pending = botFallbackQueue.shift();
+      if (pending?.searchKey) searchedBotKeywords.delete(pending.searchKey);
+    }
+    if (botFallbackAbort) {
+      botFallbackAbort.abort();
+      botFallbackAbort = null;
+    }
+    botFallbackWorkerRunning = false;
+  }
+
+  function enqueueMissingBotSearches(items) {
+    if (!botMapLoaded || !isTaskExecuteActive() || !botColConfig.visible) return;
+    let enqueued = false;
+    for (const item of items) {
+      if (!item || !item.jobName) continue;
+      if (hasBotMapping(item.planId, item.jobUuid)) continue;
+      // 明确标记为日常计划（jobType === '1'）且全量日常表中无此记录时，不再重复按词搜
+      if (item.jobType === '1') continue;
+      const searchJobType = item.jobType || '';
+      const searchKey = `${searchJobType}\0${item.jobName}`;
+      if (searchedBotKeywords.has(searchKey)) continue;
+      searchedBotKeywords.add(searchKey);
+      botFallbackQueue.push({
+        searchKey,
+        jobName: item.jobName,
+        jobType: searchJobType,
+        planId: item.planId,
+        jobUuid: item.jobUuid
+      });
+      enqueued = true;
+    }
+    if (enqueued) runBotFallbackWorker();
+  }
+
+  async function runBotFallbackWorker() {
+    if (botFallbackWorkerRunning || !botFallbackQueue.length) return;
+    botFallbackWorkerRunning = true;
+    botFallbackAbort = new AbortController();
+    const signal = botFallbackAbort.signal;
+
+    try {
+      while (botFallbackQueue.length > 0) {
+        if (signal.aborted || !isTaskExecuteActive() || !botColConfig.visible) {
+          while (botFallbackQueue.length > 0) {
+            const pending = botFallbackQueue.shift();
+            if (pending?.searchKey) searchedBotKeywords.delete(pending.searchKey);
+          }
+          break;
+        }
+
+        const task = botFallbackQueue.shift();
+        if (!task) continue;
+        // 前一条带词查询可能已经顺带拉回了该任务的映射，跳过多余请求
+        if (hasBotMapping(task.planId, task.jobUuid)) continue;
+
+        botFallbackActiveTask = task;
+        await sleep(REQUEST_INTERVAL_MS);
+        if (signal.aborted || !isTaskExecuteActive() || !botColConfig.visible) {
+          searchedBotKeywords.delete(task.searchKey);
+          botFallbackActiveTask = null;
+          continue;
+        }
+        if (hasBotMapping(task.planId, task.jobUuid)) {
+          botFallbackActiveTask = null;
+          continue;
+        }
+
+        try {
+          const result = await fetchSchedulePlans({
+            jobType: task.jobType,
+            jobName: task.jobName,
+            signal,
+            maxPages: SCHEDULE_SEARCH_MAX_PAGES,
+            stopOnMatch: { planId: task.planId, jobUuid: task.jobUuid }
+          });
+          botFallbackActiveTask = null;
+          if (!result || signal.aborted) {
+            if (signal.aborted) searchedBotKeywords.delete(task.searchKey);
+            break;
+          }
+          if (mergeBotMapping(result) && isTaskExecuteActive() && botColConfig.visible) {
+            syncBotColumn();
+          }
+        } catch (err) {
+          botFallbackActiveTask = null;
+          if (err?.name === 'AbortError' || signal.aborted) {
+            searchedBotKeywords.delete(task.searchKey);
+            break;
+          }
+          console.warn(LOG_TAG, '按搜索词补查非日常任务机器人失败:', task.jobName, err?.message || err);
+        }
+      }
+    } finally {
+      botFallbackActiveTask = null;
+      if (botFallbackAbort?.signal === signal) {
+        botFallbackAbort = null;
+      }
+      botFallbackWorkerRunning = false;
+      if (botFallbackQueue.length > 0 && isTaskExecuteActive() && botColConfig.visible) {
+        runBotFallbackWorker();
+      }
+    }
+  }
+
   function ensureBotMapLoaded() {
     if (botMapLoaded) return Promise.resolve();
     if (botMapPromise) return botMapPromise;
 
     botMapAbort = new AbortController();
     const signal = botMapAbort.signal;
-    botMapPromise = fetchAllSchedulePlans(signal)
+    // 优先仅全量拉取日常计划（jobType: '1'），避免翻历史回溯全表；非日常任务待匹配后再按搜索词补查
+    botMapPromise = fetchSchedulePlans({ jobType: '1', jobName: '', signal })
       .then(result => {
         botMapPromise = null;
         if (!result || signal.aborted) return;
-        planBotById.clear();
-        planBotByJobUuid.clear();
-        result.byId.forEach((v, k) => planBotById.set(k, v));
-        result.byJobUuid.forEach((v, k) => planBotByJobUuid.set(k, v));
+        mergeBotMapping(result);
         botMapLoaded = true;
         if (isTaskExecuteActive() && botColConfig.visible) {
           syncBotColumn();
@@ -2452,7 +2632,7 @@
       .catch(err => {
         botMapPromise = null;
         if (err?.name === 'AbortError') return;
-        console.warn(LOG_TAG, '拉取计划机器人映射失败:', err?.message || err);
+        console.warn(LOG_TAG, '拉取日常计划机器人映射失败:', err?.message || err);
       });
     return botMapPromise;
   }
@@ -2612,6 +2792,7 @@
     if (!mainTable) return;
 
     if (!botColConfig.visible || !isPlanViewTable(mainTable)) {
+      pauseBotFallbackWorker();
       if (removeBotColumn(mainTable)) {
         findStoreColumnIndex();
         if (filterInput?.value) applyFilter(filterInput.value);
@@ -2622,10 +2803,12 @@
 
     const nativeThs = getNativeHeaderCells(mainTable);
     const targetIdx = resolveBotInsertIndex(nativeThs);
+    const planNameColIdx = findNativeThIndex(nativeThs, 'planName', '计划名称');
     const sampleTh = nativeThs.find(th => !isOperationCol('', th.textContent)) || nativeThs[0];
     const baseCellClass = stripFixClasses(sampleTh?.className) || 'ant-table-cell';
 
     let structChanged = false;
+    const missingRows = [];
     isSelfModifyingDOM = true;
     try {
       const colgroup = mainTable.querySelector('colgroup');
@@ -2674,15 +2857,23 @@
         });
         if (changed) structChanged = true;
         if (!cell) return;
-        const botName = resolveRowBotName(row);
+        const meta = extractRowRecordMeta(row, planNameColIdx);
+        const botName = resolveRowBotName(row, meta);
         if (cell.textContent !== botName) cell.textContent = botName;
         const nextTitle = botName === '-' ? '' : botName;
         if (cell.title !== nextTitle) cell.title = nextTitle;
+        if (botMapLoaded && !hasBotMapping(meta.planId, meta.jobUuid) && meta.jobName) {
+          missingRows.push(meta);
+        }
       });
 
       syncTableWidth(mainTable.querySelector('table'), true);
     } finally {
       setTimeout(() => { isSelfModifyingDOM = false; }, 0);
+    }
+
+    if (missingRows.length > 0) {
+      enqueueMissingBotSearches(missingRows);
     }
 
     if (structChanged) {
@@ -3154,11 +3345,14 @@
       _statusColCache = { table: null, idx: -1 };
       _storeColIdx = -1;
       if (botMapAbort) { botMapAbort.abort(); botMapAbort = null; }
+      pauseBotFallbackWorker();
       botMapPromise = null;
       botMapLoaded = false;
       planBotById.clear();
       planBotByJobUuid.clear();
       jobPlanMap.clear();
+      jobRecordMeta.clear();
+      searchedBotKeywords.clear();
       observedFieldMeta.clear();
       observedFieldOrder = [];
 

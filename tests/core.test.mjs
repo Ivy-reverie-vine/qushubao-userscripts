@@ -336,6 +336,7 @@ function createEnv({
   };
 
   const flushAsync = async (limit = 300) => {
+    await new Promise(r => setImmediate(r));
     let n = 0;
     while (timers.length && n++ < limit) {
       timers.sort((a, b) => a.due - b.due);
@@ -1145,7 +1146,7 @@ test('机器人列：默认隐藏时不请求 schedule/page，弹窗复选框未
   assert.equal(botItem.querySelector('input[type="checkbox"]').checked, false, '默认应未勾选');
 });
 
-test('机器人列：开启后分页拉取 schedule/page（含 ≥200ms 间隔）并缓存，四处同步插列且支持 planId/jobUuid/19位ID/缺失占位', async () => {
+test('机器人列：开启后优先分页拉取日常计划（jobType=1），未命中的非日常任务再按搜索词补查（均含 ≥200ms 间隔）并复用缓存', async () => {
   const doc = createRichDom();
   buildFormInDoc(doc);
   const tbl = buildPlanTableInDoc(doc, {
@@ -1163,28 +1164,45 @@ test('机器人列：开启后分页拉取 schedule/page（含 ≥200ms 间隔�
     customDocument: doc,
     onFetch(url, body) {
       if (!url.includes('/schedule/page')) return null;
-      if (body.pageNo === 1) {
+      if (body.jobType === '1' && body.jobName === '') {
+        if (body.pageNo === 1) {
+          return {
+            code: '10000',
+            bizData: {
+              pages: '2',
+              current: '1',
+              records: [
+                { id: '1900000000000000001', jobUuid: 'other-1', jobType: 1, botName: '飞龙制冷001' },
+              ]
+            }
+          };
+        }
         return {
           code: '10000',
           bizData: {
             pages: '2',
+            current: '2',
+            records: [
+              { id: '1900000000000000002', jobUuid: 'other-2', jobType: 1, botName: '' },
+            ]
+          }
+        };
+      }
+      if (body.jobName === '回溯3') {
+        return {
+          code: '10000',
+          bizData: {
+            pages: '1',
             current: '1',
             records: [
-              { id: '1900000000000000001', jobUuid: 'other-1', jobType: 1, botName: '飞龙制冷001' },
-              { id: '1900000000000000002', jobUuid: 'other-2', jobType: 1, botName: '' },
+              { id: '1900000000000000003', jobUuid: '1900000000000000013', jobType: 2, botName: '飞龙002,飞龙003' },
             ]
           }
         };
       }
       return {
         code: '10000',
-        bizData: {
-          pages: '2',
-          current: '2',
-          records: [
-            { id: '1900000000000000003', jobUuid: '1900000000000000013', jobType: 2, botName: '飞龙002,飞龙003' },
-          ]
-        }
+        bizData: { pages: '1', current: '1', records: [] }
       };
     }
   });
@@ -1197,10 +1215,10 @@ test('机器人列：开启后分页拉取 schedule/page（含 ≥200ms 间隔�
     code: '10000',
     bizData: {
       records: [
-        { jobUuid: '1900000000000000011', planId: '1900000000000000001', rpaStatus: 5 },
-        { jobUuid: '1900000000000000012', planId: '1900000000000000002', rpaStatus: 5 },
-        { jobUuid: '1900000000000000013', rpaStatus: 5 },
-        { jobUuid: '1900000000000000099', planId: '1900000000000000099', rpaStatus: 5 },
+        { jobUuid: '1900000000000000011', planId: '1900000000000000001', jobName: '计划1', rpaStatus: 5 },
+        { jobUuid: '1900000000000000012', planId: '1900000000000000002', jobName: '计划2', rpaStatus: 5 },
+        { jobUuid: '1900000000000000013', jobName: '回溯3', rpaStatus: 5 },
+        { jobUuid: '1900000000000000099', planId: '1900000000000000099', jobName: '已删4', rpaStatus: 5 },
       ]
     }
   });
@@ -1223,9 +1241,19 @@ test('机器人列：开启后分页拉取 schedule/page（含 ≥200ms 间隔�
   await env.flushAsync();
 
   const scheduleCalls = env.fetchCalls.filter(c => c.url.includes('/schedule/page'));
-  assert.equal(scheduleCalls.length, 2, '应完整拉取 2 页 schedule/page');
-  assert.equal(scheduleCalls[0].body.jobType, '', 'jobType 应为空串以覆盖日常与回溯');
-  assert.ok(scheduleCalls[1].at - scheduleCalls[0].at >= 200, '分页间隔应 >= 200ms');
+  assert.equal(scheduleCalls.length, 4, '应先拉取 2 页日常计划，再按搜索词补查 2 条未命中行');
+  assert.equal(scheduleCalls[0].body.jobType, '1', '首阶段应限定 jobType="1" 仅查日常计划');
+  assert.equal(scheduleCalls[0].body.jobName, '');
+  assert.equal(scheduleCalls[1].body.jobType, '1');
+  assert.equal(scheduleCalls[1].body.pageNo, 2);
+  assert.ok(scheduleCalls[1].at - scheduleCalls[0].at >= 200, '日常分页间隔应 >= 200ms');
+
+  assert.equal(scheduleCalls[2].body.jobName, '回溯3', '未命中行应带搜索词查询');
+  assert.equal(scheduleCalls[2].body.jobType, '', '未提供 jobType 时带词搜索传空 jobType 覆盖回溯与实时');
+  assert.ok(scheduleCalls[2].at - scheduleCalls[1].at >= 200, '日常查询与首条补查间隔应 >= 200ms');
+
+  assert.equal(scheduleCalls[3].body.jobName, '已删4');
+  assert.ok(scheduleCalls[3].at - scheduleCalls[2].at >= 200, '连续补查间隔应 >= 200ms');
 
   assert.equal(tbl.colgroup.children.length, 5);
   assert.equal(tbl.colgroup.children[2].getAttribute('data-qsb-bot-col'), '1');
@@ -1239,10 +1267,10 @@ test('机器人列：开启后分页拉取 schedule/page（含 ≥200ms 间隔�
   assert.equal(dataRows[0].children[2].textContent, '飞龙制冷001');
   assert.equal(dataRows[0].children[2].title, '飞龙制冷001');
   assert.equal(dataRows[1].children[2].textContent, '-', '空 botName 应显示 -');
-  assert.equal(dataRows[2].children[2].textContent, '飞龙002,飞龙003', '回溯任务应次选 jobUuid 并如实展示多机器人');
+  assert.equal(dataRows[2].children[2].textContent, '飞龙002,飞龙003', '回溯任务应通过带词查询匹配 jobUuid 并如实展示多机器人');
   assert.equal(dataRows[3].children[2].textContent, '-', '已删除计划应显示 -');
 
-  // 关闭再开启 + 切日期：复用内存缓存，不发新 schedule/page 请求
+  // 关闭再开启 + 切日期：复用日常计划缓存与已查搜索词缓存，不发新 schedule/page 请求
   checkbox.checked = false;
   checkbox.dispatchEvent({ type: 'change' });
   await env.flushAsync();
@@ -1260,7 +1288,7 @@ test('机器人列：开启后分页拉取 schedule/page（含 ≥200ms 间隔�
   await env.flushAsync();
 
   const afterCalls = env.fetchCalls.filter(c => c.url.includes('/schedule/page'));
-  assert.equal(afterCalls.length, 2, '同生命周期内应复用计划机器人缓存');
+  assert.equal(afterCalls.length, 4, '同生命周期内应复用日常计划及已搜关键词缓存');
 });
 
 test('机器人列：手柄指针拖拽调序、不可越过「操作」列，持久化并在隐藏参照列时相邻回退', async () => {
@@ -2244,4 +2272,185 @@ test('店铺账号管理：翻页响应先于 React commit 触发 syncStoreColum
   assert.equal(newRow.children[2].getAttribute('data-qsb-store-col'), 'enterpriseId');
   assert.equal(newRow.children[2].textContent, 'E_PAGE2');
   assert.ok(storeObs.takeRecordsCalls > 0, '同步修改 DOM 结束时应通过 takeRecords() 排空自身记录');
+});
+
+test('机器人列：纯日常任务不发非日常搜索，已知 jobType=1 的已删日常也不重复补查', async () => {
+  const doc = createRichDom();
+  buildFormInDoc(doc);
+  const tbl = buildPlanTableInDoc(doc, {
+    headers: ['计划名称', '店铺', '取数执行', '操作'],
+    rows: [
+      { key: '1900000000000000101', cells: ['日常A', '店铺A', '已完成', '详情'] },
+      { key: '1900000000000000102', cells: ['已删日常B', '店铺B', '已完成', '详情'] },
+    ],
+  });
+
+  const env = createEnv({
+    pathname: TARGET,
+    customDocument: doc,
+    initialLocalStorage: {
+      qsb_task_exec_bot_col_v1: JSON.stringify({ visible: true, anchor: { key: 'storeName', side: 'after', label: '店铺' } })
+    },
+    onFetch(url, body) {
+      if (!url.includes('/schedule/page')) return null;
+      if (body.jobType === '1' && body.jobName === '') {
+        return {
+          code: '10000',
+          bizData: {
+            pages: '1',
+            records: [{ id: '1900000000000000201', jobUuid: '1900000000000000101', jobType: 1, botName: '日常机器人01' }]
+          }
+        };
+      }
+      return { code: '10000', bizData: { pages: '1', records: [] } };
+    }
+  });
+  env.documentBody = doc.body;
+  env.boot();
+
+  const xhr = new env.FakeXHR();
+  xhr.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/job/record/new');
+  xhr.responseText = JSON.stringify({
+    code: '10000',
+    bizData: {
+      records: [
+        { jobUuid: '1900000000000000101', planId: '1900000000000000201', jobName: '日常A', jobType: 1, rpaStatus: 5 },
+        { jobUuid: '1900000000000000102', planId: '1900000000000000202', jobName: '已删日常B', jobType: 1, rpaStatus: 5 },
+      ]
+    }
+  });
+  xhr.send('{"dateTime":"2026-11-19"}');
+  xhr.fire('load');
+  await env.flushAsync();
+
+  const scheduleCalls = env.fetchCalls.filter(c => c.url.includes('/schedule/page'));
+  assert.equal(scheduleCalls.length, 1, '全部为日常任务（含已删日常）时仅查一次 jobType="1" 全量日常计划');
+  assert.equal(scheduleCalls[0].body.jobType, '1');
+  assert.equal(scheduleCalls[0].body.jobName, '');
+
+  const rows = tbl.tbody.querySelectorAll('tr.ant-table-row');
+  assert.equal(rows[0].children[2].textContent, '日常机器人01');
+  assert.equal(rows[1].children[2].textContent, '-');
+});
+
+test('机器人列：非日常补查透传明确 jobType、顺带命中自动去重，新翻页回溯按需补查且 teardown 清缓存', async () => {
+  const doc = createRichDom();
+  buildFormInDoc(doc);
+  const tbl = buildPlanTableInDoc(doc, {
+    headers: ['计划名称', '店铺', '取数执行', '操作'],
+    rows: [
+      { key: '1900000000000000301', cells: ['飞龙-回溯-01', '店铺1', '已完成', '详情'] },
+      { key: '1900000000000000302', cells: ['飞龙-回溯-02', '店铺2', '已完成', '详情'] },
+    ],
+  });
+
+  const env = createEnv({
+    pathname: TARGET,
+    customDocument: doc,
+    initialLocalStorage: {
+      qsb_task_exec_bot_col_v1: JSON.stringify({ visible: true, anchor: { key: 'storeName', side: 'after', label: '店铺' } })
+    },
+    onFetch(url, body) {
+      if (!url.includes('/schedule/page')) return null;
+      if (body.jobType === '1' && body.jobName === '') {
+        return { code: '10000', bizData: { pages: '1', records: [] } };
+      }
+      if (body.jobName === '飞龙-回溯-01') {
+        // 模拟服务端模糊搜索顺带返回两条回溯任务，第二条应跳过重复查询
+        return {
+          code: '10000',
+          bizData: {
+            pages: '1',
+            records: [
+              { id: '1900000000000000401', jobUuid: '1900000000000000301', jobType: 2, botName: '回溯BotA' },
+              { id: '1900000000000000402', jobUuid: '1900000000000000302', jobType: 2, botName: '回溯BotB' },
+            ]
+          }
+        };
+      }
+      if (body.jobName === '实时采集-03') {
+        return {
+          code: '10000',
+          bizData: {
+            pages: '1',
+            records: [
+              { id: '1900000000000000403', jobUuid: '1900000000000000303', jobType: 3, botName: '实时BotC' },
+            ]
+          }
+        };
+      }
+      return { code: '10000', bizData: { pages: '1', records: [] } };
+    }
+  });
+  env.documentBody = doc.body;
+  env.boot();
+
+  const xhr1 = new env.FakeXHR();
+  xhr1.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/job/record/new');
+  xhr1.responseText = JSON.stringify({
+    code: '10000',
+    bizData: {
+      records: [
+        { jobUuid: '1900000000000000301', planId: '1900000000000000401', jobName: '飞龙-回溯-01', jobType: 2, rpaStatus: 5 },
+        { jobUuid: '1900000000000000302', planId: '1900000000000000402', jobName: '飞龙-回溯-02', jobType: 2, rpaStatus: 5 },
+      ]
+    }
+  });
+  xhr1.send('{"dateTime":"2026-11-19"}');
+  xhr1.fire('load');
+  await env.flushAsync();
+
+  let scheduleCalls = env.fetchCalls.filter(c => c.url.includes('/schedule/page'));
+  assert.equal(scheduleCalls.length, 2, '1 次日常计划 + 1 次按词查回溯（第 2 条已被顺带命中应跳过）');
+  assert.equal(scheduleCalls[0].body.jobType, '1');
+  assert.equal(scheduleCalls[1].body.jobType, '2', '明确 jobType=2 时应透传 jobType="2"');
+  assert.equal(scheduleCalls[1].body.jobName, '飞龙-回溯-01');
+
+  let rows = tbl.tbody.querySelectorAll('tr.ant-table-row');
+  assert.equal(rows[0].children[2].textContent, '回溯BotA');
+  assert.equal(rows[1].children[2].textContent, '回溯BotB');
+
+  // 翻页出现新的实时任务（通过 DOM 名称兜底 + jobType=3）：仅补查新任务，不重查日常计划
+  const row3 = doc.createElement('tr');
+  row3.className = 'ant-table-row ant-table-row-level-0';
+  row3.setAttribute('data-row-key', '1900000000000000303');
+  for (const text of ['实时采集-03', '店铺3', '已完成', '详情']) {
+    const td = doc.createElement('td');
+    td.className = 'ant-table-cell';
+    td.textContent = text;
+    row3.appendChild(td);
+  }
+  tbl.tbody.appendChild(row3);
+
+  const xhr2 = new env.FakeXHR();
+  xhr2.open('POST', '/frameWorkPortal/opt/qymall/1.0.0/job/record/new');
+  xhr2.responseText = JSON.stringify({
+    code: '10000',
+    bizData: {
+      records: [
+        { jobUuid: '1900000000000000303', jobType: 3, rpaStatus: 5 },
+      ]
+    }
+  });
+  xhr2.send('{"dateTime":"2026-11-19","pageNo":2}');
+  xhr2.fire('load');
+  await env.flushAsync();
+
+  scheduleCalls = env.fetchCalls.filter(c => c.url.includes('/schedule/page'));
+  assert.equal(scheduleCalls.length, 3, '新翻页的非日常行应只额外发 1 次带词搜索');
+  assert.equal(scheduleCalls[2].body.jobType, '3');
+  assert.equal(scheduleCalls[2].body.jobName, '实时采集-03', '接口未带 jobName 时应从表格计划名称列兜底提取');
+  assert.equal(row3.children[2].textContent, '实时BotC');
+
+  // 离开页面 teardown 清空缓存，再回来会重新从日常计划起查
+  env.push('/mallQuan/other');
+  await env.flushAsync();
+  env.push(TARGET);
+  await env.flushAsync();
+
+  scheduleCalls = env.fetchCalls.filter(c => c.url.includes('/schedule/page'));
+  assert.equal(scheduleCalls.length, 6, '重进页面后应重新拉取日常并按需补查未命中非日常（顺带命中仍跳过重复项）');
+  assert.equal(scheduleCalls[3].body.jobType, '1');
+  assert.equal(scheduleCalls[4].body.jobName, '飞龙-回溯-01');
+  assert.equal(scheduleCalls[5].body.jobName, '实时采集-03');
 });
